@@ -42,14 +42,21 @@ const queue = new Queue()
 const updater = new Updater()
 const requestCache = new Map<string, string>()
 
-const downloadAndSend = async (ctx: any, url: string, quality: string) => {
+const downloadAndSend = async (
+	ctx: any,
+	url: string,
+	quality: string,
+	isRawFormat = false,
+) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
 		const additionalArgs = isTiktok ? tiktokArgs : []
 
 		let formatArgs: string[] = []
-		if (quality === "audio") {
+		if (isRawFormat) {
+			formatArgs = ["-f", quality]
+		} else if (quality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
 		} else if (quality === "b") {
 			formatArgs = [
@@ -77,13 +84,16 @@ const downloadAndSend = async (ctx: any, url: string, quality: string) => {
 		])
 
 		const title = removeHashtagsMentions(info.title)
+		const caption = `${title}\n\n${link("Original Link", url)}`
 
 		if (quality === "audio") {
 			const stream = downloadFromInfo(info, "-", formatArgs)
 			const audio = new InputFile(stream.stdout)
 
+			await ctx.replyWithChatAction("upload_voice")
 			await ctx.replyWithAudio(audio, {
-				caption: title,
+				caption,
+				parse_mode: "HTML",
 				performer: info.uploader,
 				title: info.title,
 				thumbnail: getThumbnail(info.thumbnails),
@@ -103,8 +113,10 @@ const downloadAndSend = async (ctx: any, url: string, quality: string) => {
 
 			const video = new InputFile(tempFilePath)
 
+			await ctx.replyWithChatAction("upload_video")
 			await ctx.replyWithVideo(video, {
-				caption: title,
+				caption,
+				parse_mode: "HTML",
 				supports_streaming: true,
 				duration: info.duration,
 			})
@@ -261,48 +273,14 @@ bot.command("formats", async (ctx) => {
 	}
 
 	if (requestedFormat) {
-		const processing = await ctx.reply(`Queuing download for format: ${requestedFormat}...`)
+		const processing = await ctx.reply(
+			`Queuing download for format: ${requestedFormat}...`,
+		)
 		queue.add(async () => {
-			const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 			try {
-				const isTiktok = urlMatcher(url, "tiktok.com")
-				const additionalArgs = isTiktok ? tiktokArgs : []
-				const formatArgs = ["-f", requestedFormat, "--merge-output-format", "mp4"]
-
-				const info = await safeGetInfo(url, [
-					"--dump-json",
-					...formatArgs,
-					"--no-warnings",
-					"--no-playlist",
-					...(await cookieArgs()),
-					...additionalArgs,
-				])
-
-				const title = removeHashtagsMentions(info.title)
-				
-				await execFilePromise("yt-dlp", [
-					url,
-					...formatArgs,
-					"-o",
-					tempFilePath,
-					"--no-warnings",
-					"--no-playlist",
-					...(await cookieArgs()),
-					...additionalArgs,
-				])
-				
-				const video = new InputFile(tempFilePath)
-
-				await ctx.replyWithVideo(video, {
-					caption: `${title} [${requestedFormat}]`,
-					supports_streaming: true,
-					duration: info.duration,
-				})
-			} catch (error) {
-				await ctx.reply(`Download Error: ${error instanceof Error ? error.message : "Unknown"}`)
+				await downloadAndSend(ctx, url, requestedFormat, true)
 			} finally {
 				await deleteMessage(processing)
-				try { await unlink(tempFilePath) } catch {}
 			}
 		})
 		return
