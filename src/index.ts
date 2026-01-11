@@ -27,6 +27,7 @@ import { promisify } from "node:util"
 const execFilePromise = promisify(execFile)
 
 const safeGetInfo = async (url: string, args: string[]) => {
+	console.log("Running yt-dlp with:", args)
 	const { stdout } = await execFilePromise("yt-dlp", [url, ...args])
 	// Split by newline and try to parse the first valid JSON line
 	const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
