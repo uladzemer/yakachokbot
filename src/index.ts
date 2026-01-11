@@ -172,6 +172,7 @@ bot.command("formats", async (ctx) => {
 
 				const info = await getInfo(url, [
 					...formatArgs,
+					"--no-warnings",
 					"--no-playlist",
 					...(await cookieArgs()),
 					...additionalArgs,
@@ -197,7 +198,7 @@ bot.command("formats", async (ctx) => {
 
 	const processing = await ctx.reply("Fetching formats...")
 	try {
-		const info = await getInfo(url, ["--no-playlist", ...(await cookieArgs())])
+		const info = await getInfo(url, ["--no-warnings", "--no-playlist", ...(await cookieArgs())])
 
 		if (!info.formats || info.formats.length === 0) {
 			await ctx.reply("No formats found.")
@@ -319,6 +320,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		// Check available formats
 		const info = await getInfo(url.text, [
 			"--dump-json",
+			"--no-warnings",
 			"--no-playlist",
 			...(await cookieArgs()),
 			...additionalArgs,
@@ -420,6 +422,7 @@ bot.on("callback_query:data", async (ctx) => {
 
 			const info = await getInfo(url, [
 				...formatArgs,
+				"--no-warnings",
 				"--no-playlist",
 				...(await cookieArgs()),
 				...additionalArgs,
