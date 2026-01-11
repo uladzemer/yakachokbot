@@ -1,3 +1,4 @@
+import { unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
@@ -7,6 +8,7 @@ import { link, t, tiktokArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
+	COOKIE_FILE,
 	cookieArgs,
 	WHITELISTED_IDS,
 } from "./environment"
@@ -29,6 +31,56 @@ bot.use(async (ctx, next) => {
 	const isGroup = ["supergroup", "group"].includes(ctx.chat?.type ?? "")
 	if (ALLOW_GROUPS && isGroup) {
 		return await next()
+	}
+})
+
+bot.command("cookie", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await ctx.reply("To update cookies, simply send the 'cookies.txt' file as a document in this chat.")
+})
+
+bot.command("clear", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	try {
+		await unlink(COOKIE_FILE)
+		await ctx.reply("Cookies deleted successfully.")
+	} catch (error) {
+		await ctx.reply("No cookies found or could not delete.")
+	}
+})
+
+// Handle cookies.txt upload (Admin only)
+bot.on("message:document", async (ctx) => {
+	if (ctx.from.id !== ADMIN_ID) return
+
+	const doc = ctx.message.document
+	if (!doc.file_name?.endsWith(".txt") && doc.mime_type !== "text/plain") return
+
+	const processing = await ctx.reply("Updating cookies...")
+	try {
+		const file = await ctx.api.getFile(doc.file_id)
+		// Download file via the API Server
+		// Construct URL manually or use grammy's convention. 
+		// Since we use a custom API root, file path might be relative or absolute.
+		// For local mode, getFile returns absolute path. 
+		// But we can still download it via HTTP from the API server if it exposes it.
+		// Actually, standard `getFile` on local server returns the absolute path on the server's disk.
+		// We can't access that disk directly from this container.
+		// BUT, the local API server usually ALSO serves the file via HTTP if requested.
+		// Let's try fetching from the API_ROOT/file/bot<token>/<file_path>
+		
+		const downloadUrl = `${bot.api.config.client?.apiRoot}/file/bot${bot.token}/${file.file_path}`
+		const response = await fetch(downloadUrl)
+		if (!response.ok) throw new Error("Failed to download file from API server")
+		
+		const text = await response.text()
+		await writeFile(COOKIE_FILE, text)
+		
+		await ctx.reply(`Cookies updated successfully!\nLocation: ${COOKIE_FILE}`)
+	} catch (error) {
+		await ctx.reply(`Error updating cookies: ${error instanceof Error ? error.message : "Unknown"}`)
+	} finally {
+		await deleteMessage(processing)
 	}
 })
 

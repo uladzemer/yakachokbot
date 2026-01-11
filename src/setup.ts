@@ -25,6 +25,8 @@ if (WEBHOOK_URL) {
 		await bot.api.setWebhook(WEBHOOK_URL)
 		await bot.api.setMyCommands([
 			{ command: "formats", description: "Check available formats" },
+			{ command: "cookie", description: "Upload cookies info" },
+			{ command: "clear", description: "Clear cookies" },
 		])
 		console.log(`Webhook set to ${WEBHOOK_URL}`)
 
@@ -37,6 +39,8 @@ if (WEBHOOK_URL) {
 		onStart: async (me) => {
 			await bot.api.setMyCommands([
 				{ command: "formats", description: "Check available formats" },
+				{ command: "cookie", description: "Upload cookies info" },
+				{ command: "clear", description: "Clear cookies" },
 			])
 			console.log(`Bot started as @${me.username} (Polling)`)
 		},
