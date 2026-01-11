@@ -1,4 +1,4 @@
-import { unlink, writeFile } from "node:fs/promises"
+import { readFile, unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
@@ -69,21 +69,10 @@ bot.on("message:document", async (ctx) => {
 	const processing = await ctx.reply("Updating cookies...")
 	try {
 		const file = await ctx.api.getFile(doc.file_id)
-		// Download file via the API Server
-		// Construct URL manually or use grammy's convention. 
-		// Since we use a custom API root, file path might be relative or absolute.
-		// For local mode, getFile returns absolute path. 
-		// But we can still download it via HTTP from the API server if it exposes it.
-		// Actually, standard `getFile` on local server returns the absolute path on the server's disk.
-		// We can't access that disk directly from this container.
-		// BUT, the local API server usually ALSO serves the file via HTTP if requested.
-		// Let's try fetching from the API_ROOT/file/bot<token>/<file_path>
 		
-		const downloadUrl = `${API_ROOT}/file/bot${bot.token}/${file.file_path}`
-		const response = await fetch(downloadUrl)
-		if (!response.ok) throw new Error("Failed to download file from API server")
-		
-		const text = await response.text()
+		// In local mode with mounted volumes, getFile returns the absolute path on disk.
+		// Since we mounted the same volume to the same path, we can read it directly.
+		const text = await readFile(file.file_path, "utf-8")
 		await writeFile(COOKIE_FILE, text)
 		
 		await ctx.reply(`Cookies updated successfully!\nLocation: ${COOKIE_FILE}`)
@@ -94,6 +83,8 @@ bot.on("message:document", async (ctx) => {
 	}
 })
 
+//? filter out messages from non-whitelisted users
+bot.on("message:text", async (ctx, next) => {
 //? filter out messages from non-whitelisted users
 bot.on("message:text", async (ctx, next) => {
 	if (WHITELISTED_IDS.length === 0) return await next()

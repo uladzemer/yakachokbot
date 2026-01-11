@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./vaaski-telegram-ytdl:/app/storage
+      - telegram-bot-server-data:/var/lib/telegram-bot-api
     env_file:
       - .env
     environment:
