@@ -22,8 +22,6 @@ services:
       ALLOW_GROUPS: "false"
 
       TELEGRAM_API_ROOT: "http://telegram-bot-api:8081"
-      TELEGRAM_WEBHOOK_PORT: "8443"
-      TELEGRAM_WEBHOOK_URL: "http://telegram-bot:8443"
 
       # whether to automatically update yt-dlp
       # defaults to "true", set to "false" to disable

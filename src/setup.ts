@@ -16,13 +16,23 @@ bot.use(hydrateReply)
 export const server = express()
 
 server.use(express.json())
-server.use(webhookCallback(bot, "express"))
 
-console.log(`Starting bot with root ${API_ROOT}...`)
-server.listen(WEBHOOK_PORT, async () => {
-	await bot.api.setWebhook(WEBHOOK_URL)
-	console.log(`Webhook set to ${WEBHOOK_URL}`)
+if (WEBHOOK_URL) {
+	server.use(webhookCallback(bot, "express"))
 
-	const me = await bot.api.getMe()
-	console.log(`Bot started as @${me.username} on :${WEBHOOK_PORT}`)
-})
+	console.log(`Starting bot with root ${API_ROOT}...`)
+	server.listen(WEBHOOK_PORT, async () => {
+		await bot.api.setWebhook(WEBHOOK_URL)
+		console.log(`Webhook set to ${WEBHOOK_URL}`)
+
+		const me = await bot.api.getMe()
+		console.log(`Bot started as @${me.username} on :${WEBHOOK_PORT}`)
+	})
+} else {
+	console.log(`Starting bot in POLLING mode with root ${API_ROOT}...`)
+	bot.start({
+		onStart: (me) => {
+			console.log(`Bot started as @${me.username} (Polling)`)
+		},
+	})
+}

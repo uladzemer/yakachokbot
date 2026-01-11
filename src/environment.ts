@@ -15,8 +15,8 @@ const getVariable = (key: string, defaultValue?: string) => {
 
 export const YTDL_AUTOUPDATE =
 	getVariable("YTDL_AUTOUPDATE", "true") !== "false"
-export const WEBHOOK_PORT = getVariable("TELEGRAM_WEBHOOK_PORT")
-export const WEBHOOK_URL = getVariable("TELEGRAM_WEBHOOK_URL")
+export const WEBHOOK_PORT = getVariable("TELEGRAM_WEBHOOK_PORT", "8443")
+export const WEBHOOK_URL = getVariable("TELEGRAM_WEBHOOK_URL", "")
 export const API_ROOT = getVariable("TELEGRAM_API_ROOT")
 export const BOT_TOKEN = getVariable("TELEGRAM_BOT_TOKEN")
 export const ADMIN_ID = Number.parseInt(getVariable("ADMIN_ID"))
