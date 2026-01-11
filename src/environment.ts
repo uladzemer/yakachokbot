@@ -27,6 +27,7 @@ export const WHITELISTED_IDS = getVariable("WHITELISTED_IDS", "")
 export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "false") !== "false"
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
+export const ALWAYS_DOWNLOAD_BEST = getVariable("ALWAYS_DOWNLOAD_BEST", "false") !== "false"
 
 export const COOKIE_FILE = resolve(__dirname, "../storage/cookies.txt")
 export const cookieArgs = async () => {

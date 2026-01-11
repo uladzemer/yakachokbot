@@ -9,6 +9,7 @@ import { link, t, tiktokArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
+	ALWAYS_DOWNLOAD_BEST,
 	API_ROOT,
 	COOKIE_FILE,
 	cookieArgs,
@@ -40,6 +41,87 @@ const safeGetInfo = async (url: string, args: string[]) => {
 const queue = new Queue()
 const updater = new Updater()
 const requestCache = new Map<string, string>()
+
+const downloadAndSend = async (ctx: any, url: string, quality: string) => {
+	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
+	try {
+		const isTiktok = urlMatcher(url, "tiktok.com")
+		const additionalArgs = isTiktok ? tiktokArgs : []
+
+		let formatArgs: string[] = []
+		if (quality === "audio") {
+			formatArgs = ["-x", "--audio-format", "mp3"]
+		} else if (quality === "b") {
+			formatArgs = [
+				"-f",
+				"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+			]
+		} else {
+			formatArgs = [
+				"-f",
+				`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+			]
+		}
+
+		if (quality !== "audio") {
+			formatArgs.push("--merge-output-format", "mp4")
+		}
+
+		const info = await safeGetInfo(url, [
+			"--dump-json",
+			...formatArgs,
+			"--no-warnings",
+			"--no-playlist",
+			...(await cookieArgs()),
+			...additionalArgs,
+		])
+
+		const title = removeHashtagsMentions(info.title)
+
+		if (quality === "audio") {
+			const stream = downloadFromInfo(info, "-", formatArgs)
+			const audio = new InputFile(stream.stdout)
+
+			await ctx.replyWithAudio(audio, {
+				caption: title,
+				performer: info.uploader,
+				title: info.title,
+				thumbnail: getThumbnail(info.thumbnails),
+				duration: info.duration,
+			})
+		} else {
+			await execFilePromise("yt-dlp", [
+				url,
+				...formatArgs,
+				"-o",
+				tempFilePath,
+				"--no-warnings",
+				"--no-playlist",
+				...(await cookieArgs()),
+				...additionalArgs,
+			])
+
+			const video = new InputFile(tempFilePath)
+
+			await ctx.replyWithVideo(video, {
+				caption: title,
+				supports_streaming: true,
+				duration: info.duration,
+			})
+		}
+	} catch (error) {
+		const msg = `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+		if (ctx.callbackQuery) {
+			await ctx.editMessageText(msg)
+		} else {
+			await ctx.reply(msg)
+		}
+	} finally {
+		try {
+			await unlink(tempFilePath)
+		} catch {}
+	}
+}
 
 bot.use(async (ctx, next) => {
 	if (ctx.chat?.type === "private") {
@@ -181,12 +263,13 @@ bot.command("formats", async (ctx) => {
 	if (requestedFormat) {
 		const processing = await ctx.reply(`Queuing download for format: ${requestedFormat}...`)
 		queue.add(async () => {
+			const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 			try {
 				const isTiktok = urlMatcher(url, "tiktok.com")
 				const additionalArgs = isTiktok ? tiktokArgs : []
 				const formatArgs = ["-f", requestedFormat, "--merge-output-format", "mp4"]
 
-				const info = await getInfo(url, [
+				const info = await safeGetInfo(url, [
 					"--dump-json",
 					...formatArgs,
 					"--no-warnings",
@@ -196,8 +279,19 @@ bot.command("formats", async (ctx) => {
 				])
 
 				const title = removeHashtagsMentions(info.title)
-				const stream = downloadFromInfo(info, "-", formatArgs)
-				const video = new InputFile(stream.stdout, title)
+				
+				await execFilePromise("yt-dlp", [
+					url,
+					...formatArgs,
+					"-o",
+					tempFilePath,
+					"--no-warnings",
+					"--no-playlist",
+					...(await cookieArgs()),
+					...additionalArgs,
+				])
+				
+				const video = new InputFile(tempFilePath)
 
 				await ctx.replyWithVideo(video, {
 					caption: `${title} [${requestedFormat}]`,
@@ -208,6 +302,7 @@ bot.command("formats", async (ctx) => {
 				await ctx.reply(`Download Error: ${error instanceof Error ? error.message : "Unknown"}`)
 			} finally {
 				await deleteMessage(processing)
+				try { await unlink(tempFilePath) } catch {}
 			}
 		})
 		return
@@ -345,6 +440,17 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			...additionalArgs,
 		])
 
+		if (ALWAYS_DOWNLOAD_BEST) {
+			queue.add(async () => {
+				try {
+					await downloadAndSend(ctx, url.text, "b")
+				} finally {
+					await deleteMessage(processingMessage)
+				}
+			})
+			return
+		}
+
 		const requestId = randomUUID().split("-")[0]
 		requestCache.set(requestId, url.text)
 		// Expire cache after 1 hour
@@ -413,91 +519,18 @@ bot.on("callback_query:data", async (ctx) => {
 	}
 
 	await ctx.answerCallbackQuery({ text: "Queued for download..." })
-	await ctx.editMessageText(`Downloading ${quality === "b" ? "Best" : quality}...`)
+	await ctx.editMessageText(
+		`Downloading ${quality === "b" ? "Best" : quality}...`,
+	)
 
 	queue.add(async () => {
 		try {
-			const isTiktok = urlMatcher(url, "tiktok.com")
-			const isYouTubeMusic = urlMatcher(url, "music.youtube.com")
-			const additionalArgs = isTiktok ? tiktokArgs : []
-
-			let formatArgs: string[] = []
-			if (quality === "audio") {
-				formatArgs = ["-x", "--audio-format", "mp3"]
-			} else if (quality === "b") {
-				formatArgs = ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
-			} else {
-				// Specific video quality
-				formatArgs = [
-					"-f",
-					`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
-				]
-			}
-
-			// We need to fetch info again to get the download URL or verify formats for the specific quality
-			// OR we can trust yt-dlp to handle the passed args.
-			// However, for "b" (Best), we prefer direct URL if possible.
-			// For others, we might need piping.
-
-			const info = await safeGetInfo(url, [
-				"--dump-json",
-				...formatArgs,
-				"--no-warnings",
-				"--no-playlist",
-				...(await cookieArgs()),
-				...additionalArgs,
-			])
-
-			const title = removeHashtagsMentions(info.title)
-			const [download] = info.requested_downloads ?? []
-
-			// If specific quality requested (not 'b' and not 'audio'), usually implies merged formats -> use pipe
-			// If 'b', check if direct URL is available.
-			const usePipe =
-				quality !== "b" && quality !== "audio" && !isTiktok && !isYouTubeMusic
-
-			if (quality === "audio") {
-				// Audio download
-				const stream = downloadFromInfo(info, "-", formatArgs)
-				const audio = new InputFile(stream.stdout)
-
-				await ctx.replyWithAudio(audio, {
-					caption: title,
-					performer: info.uploader,
-					title: info.title,
-					thumbnail: getThumbnail(info.thumbnails),
-					duration: info.duration,
-				})
-			} else {
-				// Video download
-				let video: InputFile | string
-
-				if (usePipe || isTiktok) {
-					// Use pipe for forced quality or tiktok
-					const stream = downloadFromInfo(info, "-", formatArgs)
-					video = new InputFile(stream.stdout, title)
-				} else {
-					// Try direct URL for 'b'
-					if (!download || !download.url) throw new Error("No download available")
-					video = new InputFile({ url: download.url }, title)
-				}
-
-				await ctx.replyWithVideo(video, {
-					caption: title,
-					supports_streaming: true,
-					duration: info.duration,
-				})
-			}
-
-			await ctx.deleteMessage() // Delete the "Downloading..." status message
-		} catch (error) {
-			await ctx.editMessageText(
-				`Error: ${error instanceof Error ? error.message : "Unknown error"}`,
-			)
+			await downloadAndSend(ctx, url, quality)
+		} finally {
+			await ctx.deleteMessage()
 		}
 	})
 })
-
 bot.on("message:text", async (ctx) => {
 	const response = await ctx.replyWithHTML(t.urlReminder)
 
