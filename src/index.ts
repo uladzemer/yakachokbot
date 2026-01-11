@@ -51,10 +51,19 @@ bot.command("clear", async (ctx) => {
 
 // Handle cookies.txt upload (Admin only)
 bot.on("message:document", async (ctx) => {
-	if (ctx.from.id !== ADMIN_ID) return
+	console.log(`Received document from: ${ctx.from.id} (Admin: ${ADMIN_ID})`)
+	console.log(`File: ${ctx.message.document.file_name}, Mime: ${ctx.message.document.mime_type}`)
+
+	if (ctx.from.id !== ADMIN_ID) {
+		console.log("Ignored: Not admin")
+		return
+	}
 
 	const doc = ctx.message.document
-	if (!doc.file_name?.endsWith(".txt") && doc.mime_type !== "text/plain") return
+	if (!doc.file_name?.endsWith(".txt") && doc.mime_type !== "text/plain") {
+		console.log("Ignored: Not a text file")
+		return
+	}
 
 	const processing = await ctx.reply("Updating cookies...")
 	try {
