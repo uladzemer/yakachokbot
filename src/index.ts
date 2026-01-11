@@ -1,4 +1,5 @@
-import { readFile, unlink, writeFile } from "node:fs/promises"
+import { readdir, readFile, unlink, writeFile } from "node:fs/promises"
+import { dirname, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
@@ -71,15 +72,34 @@ bot.on("message:document", async (ctx) => {
 		const file = await ctx.api.getFile(doc.file_id)
 		console.log("File path from API:", file.file_path)
 		
-		// In local mode with mounted volumes, getFile returns the absolute path on disk.
-		// Since we mounted the same volume to the same path, we can read it directly.
-		const text = await readFile(file.file_path, "utf-8")
+		// In local mode with mounted volumes, getFile returns the absolute path on disk relative to the bot API working dir.
+		// We mounted the volume at /var/lib/telegram-bot-api
+		// Expected structure: /var/lib/telegram-bot-api/<token>/<file_path>
+		
+		const absPath = resolve("/var/lib/telegram-bot-api", bot.token, file.file_path)
+		console.log("Trying to read from:", absPath)
+
+		const text = await readFile(absPath, "utf-8")
 		await writeFile(COOKIE_FILE, text)
 		
 		await ctx.reply(`Cookies updated successfully!\nLocation: ${COOKIE_FILE}`)
 	} catch (error) {
 		console.error(error)
-		await ctx.reply(`DEBUG ERROR: ${error instanceof Error ? error.message : "Unknown"}`)
+		let debugInfo = ""
+		try {
+			const rootDir = "/var/lib/telegram-bot-api"
+			const files = await readdir(rootDir)
+			debugInfo += `\nContents of ${rootDir}: ${files.join(", ")}`
+			
+			// Try to list inside token dir if it exists
+			const tokenDir = resolve(rootDir, bot.token)
+			const tokenFiles = await readdir(tokenDir)
+			debugInfo += `\nContents of ${tokenDir}: ${tokenFiles.join(", ")}`
+		} catch (e) {
+			debugInfo += `\nFailed to list dirs: ${e instanceof Error ? e.message : "Unknown"}`
+		}
+
+		await ctx.reply(`DEBUG ERROR: ${error instanceof Error ? error.message : "Unknown"}${debugInfo}`)
 	} finally {
 		await deleteMessage(processing)
 	}
