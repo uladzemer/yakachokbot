@@ -91,3 +91,8 @@ export const tiktokArgs = [
 	"--extractor-args",
 	"tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com;app_info=7355728856979392262",
 ]
+
+export const impersonateArgs = [
+	"--extractor-args",
+	"generic:impersonate",
+]

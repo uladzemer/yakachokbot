@@ -5,7 +5,7 @@ import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
-import { link, t, tiktokArgs } from "./constants"
+import { link, t, tiktokArgs, impersonateArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
@@ -21,10 +21,41 @@ import { bot } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions } from "./util"
-import { execFile } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import { promisify } from "node:util"
 
 const execFilePromise = promisify(execFile)
+
+const updateMessage = (() => {
+	const lastUpdates = new Map<number, number>()
+	return async (ctx: any, messageId: number, text: string) => {
+		const now = Date.now()
+		const last = lastUpdates.get(messageId) || 0
+		if (now - last < 1500) return
+		lastUpdates.set(messageId, now)
+		try {
+			await ctx.api.editMessageText(ctx.chat.id, messageId, text, {
+				parse_mode: "HTML",
+			})
+		} catch {}
+	}
+})()
+
+const spawnPromise = (
+	command: string,
+	args: string[],
+	onData?: (data: string) => void,
+) => {
+	return new Promise<void>((resolve, reject) => {
+		const process = spawn(command, args)
+		process.stdout.on("data", (d) => onData?.(d.toString()))
+		process.stderr.on("data", (d) => onData?.(d.toString()))
+		process.on("close", (code) => {
+			if (code === 0) resolve()
+			else reject(new Error(`Process exited with code ${code}`))
+		})
+	})
+}
 
 const safeGetInfo = async (url: string, args: string[]) => {
 	console.log("Running yt-dlp with:", args)
@@ -39,6 +70,21 @@ const safeGetInfo = async (url: string, args: string[]) => {
 	throw new Error("No valid JSON found in yt-dlp output")
 }
 
+const soraMatcher = (url: string) => url.includes("sora.chatgpt.com")
+
+const resolveSora = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/sora_bypass.py",
+			url,
+		])
+		return JSON.parse(stdout)
+	} catch (e) {
+		console.error("Sora resolve error", e)
+		return { error: "Failed to run bypass script" }
+	}
+}
+
 const queue = new Queue()
 const updater = new Updater()
 const requestCache = new Map<string, string>()
@@ -48,6 +94,7 @@ const downloadAndSend = async (
 	url: string,
 	quality: string,
 	isRawFormat = false,
+	statusMessageId?: number,
 ) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 	try {
@@ -71,6 +118,10 @@ const downloadAndSend = async (
 			]
 		}
 
+		if (statusMessageId) {
+			await updateMessage(ctx, statusMessageId, "Fetching video info...")
+		}
+
 		const info = await safeGetInfo(url, [
 			"--dump-json",
 			...formatArgs,
@@ -78,7 +129,11 @@ const downloadAndSend = async (
 			"--no-playlist",
 			...(await cookieArgs()),
 			...additionalArgs,
+			...impersonateArgs,
 		])
+
+		const title = removeHashtagsMentions(info.title)
+		const caption = link(title || "Video", url)
 
 		if (quality !== "audio") {
 			const vcodec = info.vcodec || ""
@@ -91,13 +146,24 @@ const downloadAndSend = async (
 			}
 		}
 
-		const title = removeHashtagsMentions(info.title)
-		const caption = link(title || "Video", url)
-
 		if (quality === "audio") {
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Processing: <b>${title}</b>\nStatus: Downloading audio...`,
+				)
+			}
 			const stream = downloadFromInfo(info, "-", formatArgs)
 			const audio = new InputFile(stream.stdout)
 
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Processing: <b>${title}</b>\nStatus: Uploading...`,
+				)
+			}
 			await ctx.replyWithChatAction("upload_voice")
 			await ctx.replyWithAudio(audio, {
 				caption,
@@ -107,19 +173,57 @@ const downloadAndSend = async (
 				thumbnail: getThumbnail(info.thumbnails),
 				duration: info.duration,
 			})
+			if (statusMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+				} catch {}
+			}
 		} else {
-			await execFilePromise("yt-dlp", [
-				url,
-				...formatArgs,
-				"-o",
-				tempFilePath,
-				"--no-warnings",
-				"--no-playlist",
-				...(await cookieArgs()),
-				...additionalArgs,
-			])
+			let progressText = "Downloading..."
+			const onProgress = (data: string) => {
+				if (!statusMessageId) return
+
+				if (data.includes("[download]") && data.includes("%")) {
+					const match = data.match(/(\d+\.\d+)%/)
+					if (match) progressText = `Downloading: ${match[1]}%`
+				} else if (data.includes("[Merger]")) {
+					progressText = "Merging audio and video..."
+				} else if (data.includes("[VideoConvertor]")) {
+					progressText = "Converting to MP4..."
+				}
+
+				updateMessage(
+					ctx,
+					statusMessageId,
+					`Processing: <b>${title}</b>\nStatus: ${progressText}`,
+				)
+			}
+
+			await spawnPromise(
+				"yt-dlp",
+				[
+					url,
+					...formatArgs,
+					"-o",
+					tempFilePath,
+					"--no-warnings",
+					"--no-playlist",
+					...(await cookieArgs()),
+					...additionalArgs,
+					...impersonateArgs,
+				],
+				onProgress,
+			)
 
 			const video = new InputFile(tempFilePath)
+
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Processing: <b>${title}</b>\nStatus: Uploading...`,
+				)
+			}
 
 			await ctx.replyWithChatAction("upload_video")
 			await ctx.replyWithVideo(video, {
@@ -130,10 +234,18 @@ const downloadAndSend = async (
 				width: info.width,
 				height: info.height,
 			})
+
+			if (statusMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+				} catch {}
+			}
 		}
 	} catch (error) {
 		const msg = `Error: ${error instanceof Error ? error.message : "Unknown error"}`
-		if (ctx.callbackQuery) {
+		if (statusMessageId) {
+			await updateMessage(ctx, statusMessageId, msg)
+		} else if (ctx.callbackQuery) {
 			await ctx.editMessageText(msg)
 		} else {
 			await ctx.reply(msg)
@@ -190,19 +302,19 @@ bot.on("message:document", async (ctx) => {
 	const processing = await ctx.reply("Updating cookies...")
 	try {
 		const file = await ctx.api.getFile(doc.file_id)
-		console.log("File path from API:", file.file_path)
-		
-		// In local mode with mounted volumes, getFile returns the absolute path on disk relative to the bot API working dir.
-		// We mounted the volume at /var/lib/telegram-bot-api
-		// Expected structure: /var/lib/telegram-bot-api/<token>/<file_path>
-		
 		const absPath = resolve("/var/lib/telegram-bot-api", bot.token, file.file_path)
-		console.log("Trying to read from:", absPath)
+		const newContent = await readFile(absPath, "utf-8")
 
-		const text = await readFile(absPath, "utf-8")
-		await writeFile(COOKIE_FILE, text)
+		let currentContent = ""
+		try {
+			currentContent = await readFile(COOKIE_FILE, "utf-8")
+		} catch {}
+
+		// Ensure there's a newline between old and new content
+		const separator = currentContent.length > 0 && !currentContent.endsWith("\n") ? "\n" : ""
+		await writeFile(COOKIE_FILE, currentContent + separator + newContent)
 		
-		await ctx.reply(`Cookies updated successfully!\nLocation: ${COOKIE_FILE}`)
+		await ctx.reply(`Cookies appended successfully!\nLocation: ${COOKIE_FILE}`)
 	} catch (error) {
 		console.error(error)
 		let debugInfo = ""
@@ -287,11 +399,13 @@ bot.command("formats", async (ctx) => {
 			`Queuing download for format: ${requestedFormat}...`,
 		)
 		queue.add(async () => {
-			try {
-				await downloadAndSend(ctx, url, requestedFormat, true)
-			} finally {
-				await deleteMessage(processing)
-			}
+			await downloadAndSend(
+				ctx,
+				url,
+				requestedFormat,
+				true,
+				processing.message_id,
+			)
 		})
 		return
 	}
@@ -353,9 +467,13 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
 
+		const isTiktok = urlMatcher(url.text, "tiktok.com")
+
 	const processingMessage = await ctx.replyWithHTML(t.processing, {
 		disable_notification: true,
 	})
+
+	let autoDeleteProcessingMessage = true
 
 	if (ctx.chat.id !== ADMIN_ID) {
 		ctx
@@ -406,13 +524,23 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 	// Move queue logic to callback, here only prepare options
 	try {
+		const isSora = soraMatcher(url.text)
+		if (isSora) {
+			const soraData = await resolveSora(url.text)
+			if (soraData.video_url) {
+				url.text = soraData.video_url
+			} else if (soraData.error) {
+				console.error("Sora error:", soraData.error)
+				// Don't throw here, let yt-dlp try as fallback
+			}
+		}
+
 		const isTiktok = urlMatcher(url.text, "tiktok.com")
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
 
-		if (useCobalt) {
+		if (useCobalt && !isSora) {
 			if (await useCobaltResolver()) {
-				await deleteMessage(processingMessage)
 				return
 			}
 		}
@@ -426,15 +554,19 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			"--no-playlist",
 			...(await cookieArgs()),
 			...additionalArgs,
+			...impersonateArgs,
 		])
 
 		if (ALWAYS_DOWNLOAD_BEST) {
+			autoDeleteProcessingMessage = false
 			queue.add(async () => {
-				try {
-					await downloadAndSend(ctx, url.text, "b")
-				} finally {
-					await deleteMessage(processingMessage)
-				}
+				await downloadAndSend(
+					ctx,
+					url.text,
+					"b",
+					false,
+					processingMessage.message_id,
+				)
 			})
 			return
 		}
@@ -472,7 +604,6 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		})
 	} catch (error) {
 		if (await useCobaltResolver()) {
-			await deleteMessage(processingMessage)
 			return
 		}
 		const msg =
@@ -481,7 +612,11 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				: errorMessage(ctx.chat, `Couldn't process ${url}`)
 		await msg
 	} finally {
-		await deleteMessage(processingMessage)
+		if (autoDeleteProcessingMessage) {
+			try {
+				await deleteMessage(processingMessage)
+			} catch {}
+		}
 	}
 })
 
@@ -512,11 +647,13 @@ bot.on("callback_query:data", async (ctx) => {
 	)
 
 	queue.add(async () => {
-		try {
-			await downloadAndSend(ctx, url, quality)
-		} finally {
-			await ctx.deleteMessage()
-		}
+		await downloadAndSend(
+			ctx,
+			url,
+			quality,
+			false,
+			ctx.callbackQuery.message?.message_id,
+		)
 	})
 })
 bot.on("message:text", async (ctx) => {

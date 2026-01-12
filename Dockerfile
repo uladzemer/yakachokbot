@@ -1,4 +1,10 @@
-FROM node:22-alpine
+FROM node:22-bookworm-slim
+
+# Install system dependencies first so they are cached efficiently
+RUN apt-get update && apt-get install -y python3 python3-pip python3-full ffmpeg curl && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp and dependencies
+RUN pip install "yt-dlp[impersonate] @ https://github.com/yt-dlp/yt-dlp/archive/master.zip" curl-cffi --break-system-packages
 
 WORKDIR /app
 
@@ -9,10 +15,6 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 RUN pnpm install --frozen-lockfile
 
 COPY src ./src
-
-RUN apk add python3 ffmpeg
-ADD https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp /bin/yt-dlp
-RUN chmod +x /bin/yt-dlp
 
 EXPOSE ${TELEGRAM_WEBHOOK_PORT}
 

@@ -61,7 +61,7 @@ services:
       retries: 3
 
   cobalt:
-    image: ghcr.io/imputnet/cobalt:10
+    image: ghcr.io/imputnet/cobalt:latest
     restart: unless-stopped
     environment:
       - API_URL=http://cobalt:9000
