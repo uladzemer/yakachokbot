@@ -115,6 +115,8 @@ const downloadAndSend = async (
 ) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 	const tempThumbPath = resolve("/tmp", `${randomUUID()}.jpg`)
+	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -135,6 +137,8 @@ const downloadAndSend = async (
 				`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
 			]
 		}
+
+		console.log(`[QUEUE] Starting download: ${url} (Quality: ${quality}) in chat ${ctx.chat.id}`)
 
 		if (statusMessageId) {
 			await updateMessage(ctx, statusMessageId, "Fetching video info...")
@@ -191,6 +195,7 @@ const downloadAndSend = async (
 				thumbnail: getThumbnail(info.thumbnails),
 				duration: info.duration,
 				reply_to_message_id: replyToMessageId,
+				message_thread_id: threadId,
 			})
 			if (statusMessageId) {
 				try {
@@ -264,6 +269,7 @@ const downloadAndSend = async (
 				height,
 				thumbnail: thumbFile,
 				reply_to_message_id: replyToMessageId,
+				message_thread_id: threadId,
 			})
 
 			if (statusMessageId) {
@@ -272,13 +278,15 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		}
+		console.log(`[SUCCESS] Sent video to chat ${ctx.chat.id}`)
 	} catch (error) {
+		console.error(`[ERROR] Failed to download/send ${url}:`, error)
 		const msg = `Error: ${error instanceof Error ? error.message : "Unknown error"}`
 		if (statusMessageId) {
 			await updateMessage(ctx, statusMessageId, msg)
 		} else if (ctx.callbackQuery) {
 			await ctx.editMessageText(msg)
-		} else {
+		} else if (ctx.chat.type === "private") {
 			await ctx.reply(msg)
 		}
 	} finally {
@@ -472,7 +480,10 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
 
+	console.log(`[DEBUG] Received URL in chat ${ctx.chat.id} (${ctx.chat.type}): ${url.text}`)
+
 	const isPrivate = ctx.chat.type === "private"
+	const threadId = ctx.message.message_thread_id
 	let processingMessage: any
 
 	if (isPrivate) {
@@ -518,6 +529,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				for (const chunk of photos) {
 					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
 						reply_to_message_id: ctx.message.message_id,
+						message_thread_id: threadId,
 					})
 				}
 
@@ -527,6 +539,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			if (resolved.status === "redirect") {
 				await ctx.replyWithHTML(link("Resolved content URL", resolved.url), {
 					reply_to_message_id: ctx.message.message_id,
+					message_thread_id: threadId,
 				})
 				return true
 			}
@@ -633,6 +646,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		await ctx.reply(`Select quality for: ${title}`, {
 			reply_markup: keyboard,
 			reply_to_message_id: ctx.message.message_id,
+			message_thread_id: threadId,
 		})
 	} catch (error) {
 		if (await useCobaltResolver()) {
