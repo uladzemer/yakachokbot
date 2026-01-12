@@ -20,7 +20,7 @@ import { Queue } from "./queue"
 import { bot } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
-import { chunkArray, removeHashtagsMentions } from "./util"
+import { chunkArray, removeHashtagsMentions, cleanUrl } from "./util"
 import { execFile, spawn } from "node:child_process"
 import { promisify } from "node:util"
 
@@ -155,7 +155,7 @@ const downloadAndSend = async (
 		])
 
 		const title = overrideTitle || removeHashtagsMentions(info.title)
-		const caption = link(title || "Video", url)
+		const caption = link(title || "Video", cleanUrl(url))
 
 		if (quality !== "audio") {
 			const vcodec = info.vcodec || ""

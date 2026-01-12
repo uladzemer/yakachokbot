@@ -25,3 +25,34 @@ export const cutoffWithNotice = (text: string) => {
 
 	return text
 }
+
+export const cleanUrl = (url: string) => {
+	try {
+		const u = new URL(url)
+		const keysToDelete = []
+		for (const key of u.searchParams.keys()) {
+			if (
+				key.startsWith("utm_") ||
+				[
+					"igsh",
+					"si",
+					"fbclid",
+					"gclid",
+					"feature",
+					"share",
+					"ref",
+					"ref_src",
+					"ref_url",
+					"list",
+					"index",
+				].includes(key)
+			) {
+				keysToDelete.push(key)
+			}
+		}
+		keysToDelete.forEach((key) => u.searchParams.delete(key))
+		return u.toString()
+	} catch {
+		return url
+	}
+}
