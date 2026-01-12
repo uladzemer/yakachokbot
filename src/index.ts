@@ -249,6 +249,7 @@ const downloadAndSend = async (
 				duration: info.duration,
 				width: info.width,
 				height: info.height,
+				thumbnail: getThumbnail(info.thumbnails),
 			})
 
 			if (statusMessageId) {
