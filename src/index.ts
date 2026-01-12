@@ -71,11 +71,6 @@ const downloadAndSend = async (
 			]
 		}
 
-		if (quality !== "audio") {
-			formatArgs.push("--recode-video", "mp4")
-			formatArgs.push("--postprocessor-args", "VideoConvertor:-vf setsar=1")
-		}
-
 		const info = await safeGetInfo(url, [
 			"--dump-json",
 			...formatArgs,
@@ -84,6 +79,17 @@ const downloadAndSend = async (
 			...(await cookieArgs()),
 			...additionalArgs,
 		])
+
+		if (quality !== "audio") {
+			const vcodec = info.vcodec || ""
+			const isGoodCodec = /avc|h264|hevc|h265/i.test(vcodec)
+
+			if (!isGoodCodec) {
+				formatArgs.push("--recode-video", "mp4")
+			} else {
+				formatArgs.push("--merge-output-format", "mp4")
+			}
+		}
 
 		const title = removeHashtagsMentions(info.title)
 		const caption = link(title || "Video", url)
