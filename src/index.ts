@@ -100,7 +100,7 @@ const resolveXfree = async (url: string) => {
 	}
 }
 
-const queue = new Queue()
+const queue = new Queue(10)
 const updater = new Updater()
 const requestCache = new Map<string, { url: string; title?: string }>()
 
