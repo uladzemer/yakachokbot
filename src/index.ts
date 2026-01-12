@@ -468,11 +468,22 @@ bot.on("my_chat_member", async (ctx) => {
 	}
 })
 
-bot.on("message:text").on("::url", async (ctx, next) => {
-	const [url] = ctx.entities("url")
-	if (!url) return await next()
+bot.on("message", async (ctx, next) => {
+	const text = ctx.message.text || ctx.message.caption || ""
+	console.log(`[DEBUG] Update from chat ${ctx.chat.id} (${ctx.chat.type}). Text: "${text.substring(0, 50)}..."`)
 
-	console.log(`[DEBUG] Msg from chat ${ctx.chat.id} (${ctx.chat.type}): ${url.text}`)
+	// Manually check for URL entity to keep logic
+	const hasUrl = ctx.message.entities?.some(e => e.type === "url") || ctx.message.caption_entities?.some(e => e.type === "url")
+	
+	if (!hasUrl) return await next()
+
+	const urlEntity = ctx.message.entities?.find(e => e.type === "url") || ctx.message.caption_entities?.find(e => e.type === "url")
+	const urlText = text.substring(urlEntity!.offset, urlEntity!.offset + urlEntity!.length)
+	
+	// Mock the ctx.entities("url") behavior
+	const url = { text: urlText }
+
+	console.log(`[DEBUG] URL detected: ${url.text}`)
 
 	const isPrivate = ctx.chat.type === "private"
 	let processingMessage: any
