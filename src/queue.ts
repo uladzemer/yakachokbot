@@ -34,4 +34,8 @@ export class Queue {
 		this.queue.push(executor)
 		this.next()
 	}
+
+	clear = () => {
+		this.queue = []
+	}
 }

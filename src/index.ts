@@ -194,12 +194,16 @@ const downloadAndSend = async (
 				title: info.title,
 				thumbnail: getThumbnail(info.thumbnails),
 				duration: info.duration,
-				reply_to_message_id: replyToMessageId,
 				message_thread_id: threadId,
 			})
 			if (statusMessageId) {
 				try {
 					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+				} catch {}
+			}
+			if (replyToMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, replyToMessageId)
 				} catch {}
 			}
 		} else {
@@ -268,13 +272,18 @@ const downloadAndSend = async (
 				width,
 				height,
 				thumbnail: thumbFile,
-				reply_to_message_id: replyToMessageId,
 				message_thread_id: threadId,
 			})
 
 			if (statusMessageId) {
 				try {
 					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+				} catch {}
+			}
+
+			if (replyToMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, replyToMessageId)
 				} catch {}
 			}
 		}
@@ -316,10 +325,14 @@ bot.command("cookie", async (ctx) => {
 bot.command("clear", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
 	try {
+		queue.clear()
+		requestCache.clear()
 		await unlink(COOKIE_FILE)
-		await ctx.reply("Cookies deleted successfully.")
+		await ctx.reply("Cookies deleted, queue cleared, and request cache reset.")
 	} catch (error) {
-		await ctx.reply("No cookies found or could not delete.")
+		queue.clear()
+		requestCache.clear()
+		await ctx.reply("Queue and cache cleared. Cookies file was not found.")
 	}
 })
 
@@ -477,10 +490,21 @@ bot.on("my_chat_member", async (ctx) => {
 })
 
 bot.on("message:text").on("::url", async (ctx, next) => {
+	const now = Math.floor(Date.now() / 1000)
+	const msgDate = ctx.message.date
+	const diff = now - msgDate
+
+	console.log(`[DEBUG] Check: MsgDate=${msgDate}, Now=${now}, Diff=${diff}s. Chat=${ctx.chat.id}`)
+
+	if (diff > 60) {
+		console.log(`[IGNORE] Old message (age: ${Math.round(diff)}s) from ${ctx.chat.id}`)
+		return
+	}
+
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
 
-	console.log(`[DEBUG] Received URL in chat ${ctx.chat.id} (${ctx.chat.type}): ${url.text}`)
+	console.log(`[DEBUG] Processing URL from ${ctx.chat.id}: ${url.text}`)
 
 	const isPrivate = ctx.chat.type === "private"
 	const threadId = ctx.message.message_thread_id
@@ -494,18 +518,6 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	}
 
 	let autoDeleteProcessingMessage = true
-
-	if (isPrivate && ctx.chat.id !== ADMIN_ID) {
-		ctx
-			.forwardMessage(ADMIN_ID, { disable_notification: true })
-			.then(async (forwarded) => {
-				await bot.api.setMessageReaction(
-					forwarded.chat.id,
-					forwarded.message_id,
-					[{ type: "emoji", emoji: "🤝" }],
-				)
-			})
-	}
 
 	const useCobaltResolver = async () => {
 		try {
@@ -536,10 +548,17 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				return true
 			}
 
-			if (resolved.status === "redirect") {
-				await ctx.replyWithHTML(link("Resolved content URL", resolved.url), {
-					reply_to_message_id: ctx.message.message_id,
-					message_thread_id: threadId,
+			if (resolved.status === "redirect" || resolved.status === "tunnel") {
+				queue.add(async () => {
+					await downloadAndSend(
+						ctx,
+						resolved.url,
+						"b",
+						false,
+						processingMessage?.message_id,
+						"Instagram Video", // Default title if Cobalt doesn't provide one
+						ctx.message.message_id,
+					)
 				})
 				return true
 			}
@@ -713,6 +732,9 @@ bot.on("callback_query:data", async (ctx) => {
 	})
 })
 bot.on("message:text", async (ctx) => {
+	// Ignore old messages in catch-all too
+	if (Date.now() / 1000 - ctx.message.date > 120) return
+
 	const response = await ctx.replyWithHTML(t.urlReminder)
 
 	if (ctx.from.language_code && ctx.from.language_code !== "en") {

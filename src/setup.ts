@@ -43,6 +43,7 @@ if (WEBHOOK_URL) {
 } else {
 	console.log(`Starting bot in POLLING mode with root ${API_ROOT}...`)
 	bot.start({
+		drop_pending_updates: true,
 		allowed_updates: ["message", "callback_query", "my_chat_member"],
 		onStart: async (me) => {
 			await bot.api.setMyCommands([
