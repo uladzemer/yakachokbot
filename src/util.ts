@@ -45,6 +45,17 @@ export const cleanUrl = (url: string) => {
 					"ref_url",
 					"list",
 					"index",
+					"start_radio",
+					"rv",
+					"pp",
+					"ab_channel",
+					"_t",
+					"_r",
+					"tt_from",
+					"sender_device",
+					"web_id",
+					"is_from_webapp",
+					"is_copy_url",
 				].includes(key)
 			) {
 				keysToDelete.push(key)
