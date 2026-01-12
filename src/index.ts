@@ -85,9 +85,24 @@ const resolveSora = async (url: string) => {
 	}
 }
 
+const xfreeMatcher = (url: string) => url.includes("xfree.com")
+
+const resolveXfree = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/xfree_bypass.py",
+			url,
+		])
+		return JSON.parse(stdout)
+	} catch (e) {
+		console.error("Xfree resolve error", e)
+		return { error: "Failed to run bypass script" }
+	}
+}
+
 const queue = new Queue()
 const updater = new Updater()
-const requestCache = new Map<string, string>()
+const requestCache = new Map<string, { url: string; title?: string }>()
 
 const downloadAndSend = async (
 	ctx: any,
@@ -95,6 +110,7 @@ const downloadAndSend = async (
 	quality: string,
 	isRawFormat = false,
 	statusMessageId?: number,
+	overrideTitle?: string,
 ) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 	try {
@@ -132,7 +148,7 @@ const downloadAndSend = async (
 			...impersonateArgs,
 		])
 
-		const title = removeHashtagsMentions(info.title)
+		const title = overrideTitle || removeHashtagsMentions(info.title)
 		const caption = link(title || "Video", url)
 
 		if (quality !== "audio") {
@@ -524,14 +540,28 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 	// Move queue logic to callback, here only prepare options
 	try {
+		let bypassTitle: string | undefined
+
 		const isSora = soraMatcher(url.text)
 		if (isSora) {
 			const soraData = await resolveSora(url.text)
 			if (soraData.video_url) {
 				url.text = soraData.video_url
+				bypassTitle = soraData.title
 			} else if (soraData.error) {
 				console.error("Sora error:", soraData.error)
 				// Don't throw here, let yt-dlp try as fallback
+			}
+		}
+
+		const isXfree = xfreeMatcher(url.text)
+		if (isXfree) {
+			const xfreeData = await resolveXfree(url.text)
+			if (xfreeData.video_url) {
+				url.text = xfreeData.video_url
+				bypassTitle = xfreeData.title
+			} else if (xfreeData.error) {
+				console.error("Xfree error:", xfreeData.error)
 			}
 		}
 
@@ -557,6 +587,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			...impersonateArgs,
 		])
 
+		const title = bypassTitle || removeHashtagsMentions(info.title)
+
 		if (ALWAYS_DOWNLOAD_BEST) {
 			autoDeleteProcessingMessage = false
 			queue.add(async () => {
@@ -566,13 +598,14 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					"b",
 					false,
 					processingMessage.message_id,
+					title,
 				)
 			})
 			return
 		}
 
 		const requestId = randomUUID().split("-")[0]
-		requestCache.set(requestId, url.text)
+		requestCache.set(requestId, { url: url.text, title })
 		// Expire cache after 1 hour
 		setTimeout(() => requestCache.delete(requestId), 3600000)
 
@@ -598,7 +631,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		keyboard.text("Audio (MP3)", `d:${requestId}:audio`).row()
 		keyboard.text("Cancel", `d:${requestId}:cancel`)
 
-		await ctx.reply(`Select quality for: ${removeHashtagsMentions(info.title)}`, {
+		await ctx.reply(`Select quality for: ${title}`, {
 			reply_markup: keyboard,
 			reply_to_message_id: ctx.message.message_id,
 		})
@@ -609,7 +642,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const msg =
 			error instanceof Error
 				? errorMessage(ctx.chat, error.message)
-				: errorMessage(ctx.chat, `Couldn't process ${url}`)
+				: errorMessage(ctx.chat, `Couldn't process ${url.text}`)
 		await msg
 	} finally {
 		if (autoDeleteProcessingMessage) {
@@ -625,15 +658,17 @@ bot.on("callback_query:data", async (ctx) => {
 	if (!data.startsWith("d:")) return await ctx.answerCallbackQuery()
 
 	const [, requestId, quality] = data.split(":")
-	const url = requestCache.get(requestId)
+	const cached = requestCache.get(requestId)
 
-	if (!url) {
+	if (!cached) {
 		await ctx.answerCallbackQuery({
 			text: "Request expired or invalid.",
 			show_alert: true,
 		})
 		return await ctx.deleteMessage()
 	}
+
+	const { url, title } = cached
 
 	if (quality === "cancel") {
 		requestCache.delete(requestId)
@@ -653,6 +688,7 @@ bot.on("callback_query:data", async (ctx) => {
 			quality,
 			false,
 			ctx.callbackQuery.message?.message_id,
+			title,
 		)
 	})
 })
