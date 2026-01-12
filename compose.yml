@@ -71,6 +71,13 @@ services:
       timeout: 30s
       retries: 3
 
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 3600 --cleanup
+
 volumes:
   telegram-bot-server-data:
     driver: local
