@@ -497,6 +497,15 @@ bot.command("formats", async (ctx) => {
 	}
 })
 
+bot.on("my_chat_member", async (ctx) => {
+	if (ctx.myChatMember.new_chat_member.status === "member" || ctx.myChatMember.new_chat_member.status === "administrator") {
+		await ctx.replyWithHTML(
+			`<b>Hello!</b> I'm ready to download videos here.\n\n` +
+			`I work in <b>Silent Mode</b>: just send a link (TikTok, YouTube, Instagram, etc.), and I'll reply with the video. No commands needed!`,
+		)
+	}
+})
+
 bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()

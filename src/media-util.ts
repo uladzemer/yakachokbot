@@ -18,18 +18,35 @@ export const getVideoMetadata = async (filePath: string) => {
 			"-select_streams",
 			"v:0",
 			"-show_entries",
-			"stream=width,height,duration",
+			"stream=width,height,duration,sample_aspect_ratio",
 			"-of",
 			"json",
 			filePath,
 		])
 		const data = JSON.parse(stdout)
 		const stream = data.streams?.[0]
-		return {
-			width: stream?.width ? Number(stream.width) : undefined,
-			height: stream?.height ? Number(stream.height) : undefined,
-			duration: stream?.duration ? Math.ceil(Number(stream.duration)) : undefined,
+
+		if (!stream) return {}
+
+		let width = Number(stream.width)
+		let height = Number(stream.height)
+		const duration = stream.duration ? Math.ceil(Number(stream.duration)) : undefined
+
+		// Handle Sample Aspect Ratio (SAR) if present (e.g. "16:9", "64:45")
+		// SAR tells us that pixels aren't square. Display Width = Width * SAR.
+		if (stream.sample_aspect_ratio && stream.sample_aspect_ratio !== "N/A") {
+			const parts = stream.sample_aspect_ratio.split(":")
+			if (parts.length === 2) {
+				const num = Number(parts[0])
+				const den = Number(parts[1])
+				if (num > 0 && den > 0 && num !== den) {
+					// We usually keep height constant and adjust width for display aspect ratio
+					width = Math.round(width * (num / den))
+				}
+			}
 		}
+
+		return { width, height, duration }
 	} catch (e) {
 		console.error("ffprobe error:", e)
 		return {}
