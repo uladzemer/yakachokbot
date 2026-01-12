@@ -1,32 +1,37 @@
-type GenericFunction = (...parameters: unknown[]) => unknown
+type GenericFunction = (...parameters: unknown[]) => Promise<unknown>
 
 export class Queue {
 	private queue: GenericFunction[] = []
-	private running = false
+	private active = 0
+	private concurrency: number
+
+	constructor(concurrency = 5) {
+		this.concurrency = concurrency
+	}
 
 	private run = async (executor: GenericFunction) => {
+		this.active++
 		try {
 			await executor()
 		} catch (error) {
 			console.log(error)
+		} finally {
+			this.active--
+			this.next()
 		}
 	}
-	private bump = async () => {
-		if (this.running) return
-		this.running = true
 
-		while (this.queue.length > 0) {
+	private next = () => {
+		while (this.active < this.concurrency && this.queue.length > 0) {
 			const nextUp = this.queue.shift()
-			if (!nextUp) break
-
-			await this.run(nextUp)
+			if (nextUp) {
+				this.run(nextUp)
+			}
 		}
-
-		this.running = false
 	}
 
 	add = <F extends GenericFunction>(executor: F) => {
 		this.queue.push(executor)
-		this.bump()
+		this.next()
 	}
 }
