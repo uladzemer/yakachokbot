@@ -369,44 +369,6 @@ bot.on("message:document", async (ctx) => {
 	}
 })
 
-//? filter out messages from non-whitelisted users
-bot.on("message:text", async (ctx, next) => {
-	if (WHITELISTED_IDS.length === 0) return await next()
-	if (WHITELISTED_IDS.includes(ctx.from?.id)) return await next()
-
-	const deniedResponse = await ctx.replyWithHTML(t.deniedMessage, {
-		link_preview_options: { is_disabled: true },
-	})
-
-	await Promise.all([
-		(async () => {
-			if (ctx.from.language_code && ctx.from.language_code !== "en") {
-				const translated = await translateText(
-					t.deniedMessage,
-					ctx.from.language_code,
-				)
-				if (translated === t.deniedMessage) return
-				await bot.api.editMessageText(
-					ctx.chat.id,
-					deniedResponse.message_id,
-					translated,
-					{ parse_mode: "HTML", link_preview_options: { is_disabled: true } },
-				)
-			}
-		})(),
-		(async () => {
-			const forwarded = await ctx.forwardMessage(ADMIN_ID, {
-				disable_notification: true,
-			})
-			await bot.api.setMessageReaction(
-				forwarded.chat.id,
-				forwarded.message_id,
-				[{ type: "emoji", emoji: "🖕" }],
-			)
-		})(),
-	])
-})
-
 bot.on("message:text", async (ctx, next) => {
 	if (updater.updating === false) return await next()
 
