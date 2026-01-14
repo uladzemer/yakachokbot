@@ -25,11 +25,13 @@ if (WEBHOOK_URL) {
 		await bot.api.setWebhook(WEBHOOK_URL)
 		await bot.api.setMyCommands([
 			{ command: "formats", description: "Показать доступные форматы" },
+			{ command: "cancel", description: "Отменить все задания" },
 		])
 
 		await bot.api.setMyCommands(
 			[
 				{ command: "formats", description: "Показать доступные форматы" },
+				{ command: "cancel", description: "Отменить все задания" },
 				{ command: "cookie", description: "Upload cookies info" },
 				{ command: "clear", description: "Clear cookies" },
 			],
@@ -48,11 +50,13 @@ if (WEBHOOK_URL) {
 		onStart: async (me) => {
 			await bot.api.setMyCommands([
 				{ command: "formats", description: "Показать доступные форматы" },
+				{ command: "cancel", description: "Отменить все задания" },
 			])
 
 			await bot.api.setMyCommands(
 				[
 					{ command: "formats", description: "Показать доступные форматы" },
+					{ command: "cancel", description: "Отменить все задания" },
 					{ command: "cookie", description: "Upload cookies info" },
 					{ command: "clear", description: "Clear cookies" },
 				],

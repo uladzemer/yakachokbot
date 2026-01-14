@@ -58,4 +58,3 @@ export class Queue {
 	getPendingCount = () => this.queue.length
 	getActiveCount = () => this.active
 }
-}
