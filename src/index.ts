@@ -2,7 +2,6 @@ import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/p
 import { dirname, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
-import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
@@ -22,10 +21,39 @@ import { bot } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions, cleanUrl } from "./util"
-import { execFile, spawn } from "node:child_process"
-import { promisify } from "node:util"
+import { execFile, spawn, type ExecFileOptions } from "node:child_process"
 
-const execFilePromise = promisify(execFile)
+const execFilePromise = (
+	command: string,
+	args: string[],
+	options: ExecFileOptions & { signal?: AbortSignal } = {},
+) => {
+	return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+		let settled = false
+		const child = execFile(command, args, options, (error, stdout, stderr) => {
+			if (settled) return
+			settled = true
+			if (error) return reject(error)
+			resolve({ stdout, stderr })
+		})
+
+		const signal = options.signal
+		if (!signal) return
+		if (signal.aborted) {
+			settled = true
+			child.kill()
+			return reject(new Error("Cancelled"))
+		}
+		const onAbort = () => {
+			if (settled) return
+			settled = true
+			child.kill()
+			reject(new Error("Cancelled"))
+		}
+		signal.addEventListener("abort", onAbort, { once: true })
+		child.on("exit", () => signal.removeEventListener("abort", onAbort))
+	})
+}
 
 const updateMessage = (() => {
 	const lastUpdates = new Map<number, number>()
@@ -46,11 +74,21 @@ const spawnPromise = (
 	command: string,
 	args: string[],
 	onData?: (data: string) => void,
+	signal?: AbortSignal,
 ) => {
 	return new Promise<void>((resolve, reject) => {
+		if (signal?.aborted) return reject(new Error("Cancelled"))
 		const process = spawn(command, args)
 		process.stdout.on("data", (d) => onData?.(d.toString()))
 		process.stderr.on("data", (d) => onData?.(d.toString()))
+		const onAbort = () => {
+			process.kill()
+			reject(new Error("Cancelled"))
+		}
+		if (signal) {
+			signal.addEventListener("abort", onAbort, { once: true })
+			process.on("close", () => signal.removeEventListener("abort", onAbort))
+		}
 		process.on("close", (code) => {
 			if (code === 0) resolve()
 			else reject(new Error(`Process exited with code ${code}`))
@@ -58,13 +96,17 @@ const spawnPromise = (
 	})
 }
 
-const safeGetInfo = async (url: string, args: string[]) => {
+const safeGetInfo = async (url: string, args: string[], signal?: AbortSignal) => {
 	const runtimeArgs = args.includes("--js-runtimes") ? args : [...jsRuntimeArgs, ...args]
 	const runtimeArgsWithCache = runtimeArgs.includes("--no-cache-dir")
 		? runtimeArgs
 		: [...runtimeArgs, "--no-cache-dir"]
 	console.log("Running yt-dlp with:", runtimeArgsWithCache)
-	const { stdout } = await execFilePromise("yt-dlp", [url, ...runtimeArgsWithCache])
+	const { stdout } = await execFilePromise(
+		"yt-dlp",
+		[url, ...runtimeArgsWithCache],
+		{ signal },
+	)
 	// Split by newline and try to parse the first valid JSON line
 	const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
 	for (const line of lines) {
@@ -150,7 +192,9 @@ const isYouTubeUrl = (url: string) => {
 
 const youtubeExtractorArgs = [
 	"--extractor-args",
-	"youtube:player_client=android_sdkless,web_safari",
+	"youtube:player_client=tv,web_safari",
+	"--remote-components",
+	"ejs:github",
 ]
 
 const soraMatcher = (url: string) => url.includes("sora.chatgpt.com")
@@ -186,7 +230,14 @@ const resolveXfree = async (url: string) => {
 const queue = new Queue(10)
 const MAX_GLOBAL_TASKS = 10
 const MAX_USER_URLS = 3
-type JobMeta = { id: string; userId: number; url: string; lockId: string }
+type JobMeta = {
+	id: string
+	userId: number
+	url: string
+	lockId: string
+	state: "pending" | "active"
+	cancel: () => void
+}
 const jobMeta = new Map<string, JobMeta>()
 type UrlLockState = { lockId: string; state: "reserved" | "active" }
 const userUrlLocks = new Map<number, Map<string, UrlLockState>>()
@@ -255,15 +306,25 @@ const enqueueJob = (
 	userId: number,
 	url: string,
 	lockId: string,
-	executor: () => Promise<void>,
+	executor: (signal: AbortSignal) => Promise<void>,
 ) => {
 	const normalized = normalizeUrl(url)
 	const jobId = randomUUID()
-	jobMeta.set(jobId, { id: jobId, userId, url: normalized, lockId })
+	const controller = new AbortController()
+	jobMeta.set(jobId, {
+		id: jobId,
+		userId,
+		url: normalized,
+		lockId,
+		state: "pending",
+		cancel: () => controller.abort(),
+	})
 	activateUserUrlLock(userId, normalized, lockId)
 	queue.add(async () => {
+		const meta = jobMeta.get(jobId)
+		if (meta) meta.state = "active"
 		try {
-			await executor()
+			await executor(controller.signal)
 		} finally {
 			jobMeta.delete(jobId)
 			unlockUserUrl(userId, normalized, lockId)
@@ -281,10 +342,17 @@ const cancelUserJobs = (userId: number) => {
 			jobMeta.delete(entry.id)
 		}
 	}
+	let activeCancelled = 0
+	for (const meta of jobMeta.values()) {
+		if (meta.userId === userId && meta.state === "active") {
+			meta.cancel()
+			activeCancelled++
+		}
+	}
 	const remainingActive = Array.from(jobMeta.values()).filter(
 		(job) => job.userId === userId,
 	).length
-	return { removedCount: removed.length, remainingActive }
+	return { removedCount: removed.length, activeCancelled, remainingActive }
 }
 
 const cancelUserRequests = (userId: number) => {
@@ -624,6 +692,9 @@ const sendCombineAudioSection = async (
 	})
 }
 
+const isAbortError = (error: unknown) =>
+	error instanceof Error && error.message === "Cancelled"
+
 const downloadAndSend = async (
 	ctx: any,
 	url: string,
@@ -632,7 +703,10 @@ const downloadAndSend = async (
 	statusMessageId?: number,
 	overrideTitle?: string,
 	replyToMessageId?: number,
+	signal?: AbortSignal,
+	forceAudio = false,
 ) => {
+	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
 	const tempDir = resolve("/tmp", `telegram-ytdl-${tempBaseId}`)
 	await mkdir(tempDir, { recursive: true })
@@ -651,6 +725,7 @@ const downloadAndSend = async (
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
 		const isMp3Format = isRawFormat && quality === "mp3"
+		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
 		let formatArgs: string[] = []
 		if (isRawFormat) {
 			if (isMp3Format) {
@@ -678,16 +753,20 @@ const downloadAndSend = async (
 			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
 		}
 
-		const info = await safeGetInfo(url, [
-			"--dump-json",
-			...formatArgs,
-			"--no-warnings",
-			"--no-playlist",
-			...cookieArgsList,
-			...additionalArgs,
-			...impersonateArgs,
-			...youtubeArgs,
-		])
+		const info = await safeGetInfo(
+			url,
+			[
+				"--dump-json",
+				...formatArgs,
+				"--no-warnings",
+				"--no-playlist",
+				...cookieArgsList,
+				...additionalArgs,
+				...impersonateArgs,
+				...youtubeArgs,
+			],
+			signal,
+		)
 
 		const title = overrideTitle || removeHashtagsMentions(info.title)
 		const caption = link(title || "Video", cleanUrl(url))
@@ -743,7 +822,7 @@ const downloadAndSend = async (
 			formatNote.includes("storyboard") ||
 			formatLine.includes("storyboard")
 
-		if (quality !== "audio" && !isMp3Format) {
+		if (!isAudioRequest) {
 			const vcodec = info.vcodec || ""
 			const acodec = info.acodec || ""
 			let combinedVideoCodec = vcodec
@@ -790,7 +869,12 @@ const downloadAndSend = async (
 			formatArgs.push("--no-cache-dir")
 		}
 
-		if (quality === "audio" || isMp3Format) {
+		if (isAudioRequest) {
+			if (isMp3Format) {
+				tempFilePath = resolve(tempDir, "audio.mp3")
+			} else if (info.ext && info.ext !== "none") {
+				tempFilePath = resolve(tempDir, `audio.${info.ext}`)
+			}
 			if (statusMessageId) {
 				await updateMessage(
 					ctx,
@@ -798,8 +882,25 @@ const downloadAndSend = async (
 					`Обработка: <b>${title}</b>\nСтатус: Скачиваем аудио...`,
 				)
 			}
-			const stream = downloadFromInfo(info, "-", formatArgs)
-			const audio = new InputFile(stream.stdout)
+			await spawnPromise(
+				"yt-dlp",
+				[
+					url,
+					...formatArgs,
+					"-o",
+					tempFilePath,
+					"--no-part",
+					"--no-warnings",
+					"--no-playlist",
+					...cookieArgsList,
+					...additionalArgs,
+					...impersonateArgs,
+					...youtubeArgs,
+				],
+				undefined,
+				signal,
+			)
+			const audio = new InputFile(tempFilePath)
 
 			if (statusMessageId) {
 				await updateMessage(
@@ -898,6 +999,7 @@ const downloadAndSend = async (
 						...formatArgs,
 						"-o",
 						tempFilePath,
+						"--no-part",
 						"--no-warnings",
 						"--no-playlist",
 						...cookieArgsList,
@@ -906,6 +1008,7 @@ const downloadAndSend = async (
 						...youtubeArgs,
 					],
 					onProgress,
+					signal,
 				)
 			} finally {
 				if (statusHeartbeat) clearInterval(statusHeartbeat)
@@ -929,24 +1032,29 @@ const downloadAndSend = async (
 							`Обработка: <b>${title}</b>\nСтатус: Конвертируем аудио...`,
 						)
 					}
-					await spawnPromise("ffmpeg", [
-						"-y",
-						"-i",
-						tempFilePath,
-						"-c:v",
-						"copy",
-						"-c:a",
-						"aac",
-						"-profile:a",
-						"aac_low",
-						"-b:a",
-						"256k",
-						"-ar",
-						"48000",
-						"-movflags",
-						"+faststart",
-						audioFixedPath,
-					])
+					await spawnPromise(
+						"ffmpeg",
+						[
+							"-y",
+							"-i",
+							tempFilePath,
+							"-c:v",
+							"copy",
+							"-c:a",
+							"aac",
+							"-profile:a",
+							"aac_low",
+							"-b:a",
+							"256k",
+							"-ar",
+							"48000",
+							"-movflags",
+							"+faststart",
+							audioFixedPath,
+						],
+						undefined,
+						signal,
+					)
 					if (await fileExists(audioFixedPath, 1024)) {
 						await unlink(tempFilePath)
 						tempFilePath = audioFixedPath
@@ -1036,6 +1144,7 @@ const downloadAndSend = async (
 		}
 		console.log(`[SUCCESS] Sent video to chat ${ctx.chat.id}`)
 	} catch (error) {
+		if (isAbortError(error)) return
 		console.error(`[ERROR] Failed to download/send ${url}:`, error)
 		await notifyAdminError(
 			ctx.chat,
@@ -1084,6 +1193,11 @@ bot.command("clear", async (ctx) => {
 				jobMeta.delete(entry.id)
 			}
 		}
+		for (const meta of jobMeta.values()) {
+			if (meta.state === "active") {
+				meta.cancel()
+			}
+		}
 		requestCache.clear()
 		await unlink(COOKIE_FILE)
 		await ctx.reply("Cookies deleted, queue cleared, and request cache reset.")
@@ -1094,6 +1208,11 @@ bot.command("clear", async (ctx) => {
 			if (meta) {
 				unlockUserUrl(meta.userId, meta.url, meta.lockId)
 				jobMeta.delete(entry.id)
+			}
+		}
+		for (const meta of jobMeta.values()) {
+			if (meta.state === "active") {
+				meta.cancel()
 			}
 		}
 		requestCache.clear()
@@ -1175,13 +1294,18 @@ bot.command("cancel", async (ctx) => {
 	const userId = ctx.from?.id
 	if (!userId) return
 	const removedRequests = cancelUserRequests(userId)
-	const { removedCount, remainingActive } = cancelUserJobs(userId)
-	if (removedCount === 0 && remainingActive === 0 && removedRequests === 0) {
+	const { removedCount, activeCancelled, remainingActive } = cancelUserJobs(userId)
+	if (
+		removedCount === 0 &&
+		activeCancelled === 0 &&
+		remainingActive === 0 &&
+		removedRequests === 0
+	) {
 		await ctx.reply("У вас нет активных заданий.")
 		return
 	}
 	await ctx.reply(
-		`Отменено заданий в очереди: ${removedCount}. Активных в работе: ${remainingActive}.`,
+		`Отменено в очереди: ${removedCount}. Запрошена отмена активных: ${activeCancelled}. Активных в работе: ${remainingActive}.`,
 	)
 })
 
@@ -1451,7 +1575,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				})
 				return
 			}
-			enqueueJob(userId, url.text, lockId, async () => {
+			enqueueJob(userId, url.text, lockId, async (signal) => {
 				await downloadAndSend(
 					ctx,
 					url.text,
@@ -1460,6 +1584,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					processingMessage?.message_id,
 					title,
 					ctx.message.message_id,
+					signal,
 				)
 			})
 			lockTransferred = true
@@ -1603,7 +1728,7 @@ bot.on("callback_query:data", async (ctx) => {
 			}
 			requestCache.delete(requestId)
 			const processing = await ctx.reply("Ставим в очередь MP3...")
-			enqueueJob(userId, cached.url, cached.lockId, async () => {
+			enqueueJob(userId, cached.url, cached.lockId, async (signal) => {
 				await downloadAndSend(
 					ctx,
 					cached.url,
@@ -1612,6 +1737,7 @@ bot.on("callback_query:data", async (ctx) => {
 					processing.message_id,
 					cached.title,
 					ctx.callbackQuery.message?.message_id,
+					signal,
 				)
 			})
 			return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -1725,7 +1851,7 @@ bot.on("callback_query:data", async (ctx) => {
 		const processing = await ctx.reply(
 			`Ставим в очередь формат: ${formatString}...`,
 		)
-		enqueueJob(userId, cached.url, cached.lockId, async () => {
+		enqueueJob(userId, cached.url, cached.lockId, async (signal) => {
 			await downloadAndSend(
 				ctx,
 				cached.url,
@@ -1734,6 +1860,7 @@ bot.on("callback_query:data", async (ctx) => {
 				processing.message_id,
 				cached.title,
 				ctx.callbackQuery.message?.message_id,
+				signal,
 			)
 		})
 		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -1770,6 +1897,14 @@ bot.on("callback_query:data", async (ctx) => {
 
 	const predefinedQualities = ["b", "2160", "1440", "1080", "720", "480", "audio"]
 	const isRawFormat = !predefinedQualities.includes(quality)
+	const selectedFormat = cached.formats?.find(
+		(f: any) => `${f?.format_id}` === quality,
+	)
+	const forceAudio =
+		!!selectedFormat &&
+		selectedFormat.vcodec === "none" &&
+		selectedFormat.acodec &&
+		selectedFormat.acodec !== "none"
 	const userId = ctx.from?.id
 	if (!userId) return
 	const blockReason = getQueueBlockReason(userId, url, cached.lockId)
@@ -1786,7 +1921,7 @@ bot.on("callback_query:data", async (ctx) => {
 		return
 	}
 	requestCache.delete(requestId)
-	enqueueJob(userId, url, cached.lockId, async () => {
+	enqueueJob(userId, url, cached.lockId, async (signal) => {
 		await downloadAndSend(
 			ctx,
 			url,
@@ -1795,6 +1930,8 @@ bot.on("callback_query:data", async (ctx) => {
 			ctx.callbackQuery.message?.message_id,
 			title,
 			ctx.callbackQuery.message?.reply_to_message?.message_id,
+			signal,
+			forceAudio,
 		)
 	})
 })
