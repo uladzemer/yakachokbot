@@ -1,10 +1,10 @@
 FROM node:22-bookworm-slim
 
 # Install system dependencies first so they are cached efficiently
-RUN apt-get update && apt-get install -y python3 python3-pip python3-full ffmpeg curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 python3-pip python3-full ffmpeg curl build-essential python3-dev chromium && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp and dependencies
-RUN pip install "yt-dlp[impersonate] @ https://github.com/yt-dlp/yt-dlp/archive/master.zip" curl-cffi --break-system-packages
+RUN pip install -U "yt-dlp[impersonate]" --break-system-packages
 
 WORKDIR /app
 

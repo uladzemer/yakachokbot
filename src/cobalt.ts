@@ -28,7 +28,7 @@ const cobaltRegexes = [
 	/^(?:https:\/\/)?(?:www\.)?threads\.net\/@\w+\/post\/.+/,
 
 	// instagram posts
-	// /^(?:https:\/\/)?(?:www\.)?instagram\.com\/p\/.+$/,
+	/^(?:https:\/\/)?(?:www\.)?instagram\.com\/p\/.+$/,
 ]
 
 export const cobaltMatcher = (url: string) => {

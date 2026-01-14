@@ -61,7 +61,7 @@ export const t = {
 	urlReminder: "You need to send an URL to download stuff.",
 	maintenanceNotice:
 		"Bot is currently under maintenance, it'll return shortly.",
-	processing: "Processing...",
+	processing: "Обработка...",
 	deniedMessage: [
 		bold("This bot is private."),
 		"",
@@ -98,3 +98,5 @@ export const impersonateArgs = [
 	"--extractor-args",
 	"generic:impersonate=chrome",
 ]
+
+export const jsRuntimeArgs = ["--js-runtimes", "node"]

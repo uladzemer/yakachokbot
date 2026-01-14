@@ -24,12 +24,12 @@ if (WEBHOOK_URL) {
 	server.listen(WEBHOOK_PORT, async () => {
 		await bot.api.setWebhook(WEBHOOK_URL)
 		await bot.api.setMyCommands([
-			{ command: "formats", description: "Check available formats" },
+			{ command: "formats", description: "Показать доступные форматы" },
 		])
 
 		await bot.api.setMyCommands(
 			[
-				{ command: "formats", description: "Check available formats" },
+				{ command: "formats", description: "Показать доступные форматы" },
 				{ command: "cookie", description: "Upload cookies info" },
 				{ command: "clear", description: "Clear cookies" },
 			],
@@ -47,12 +47,12 @@ if (WEBHOOK_URL) {
 		allowed_updates: ["message", "callback_query", "my_chat_member"],
 		onStart: async (me) => {
 			await bot.api.setMyCommands([
-				{ command: "formats", description: "Check available formats" },
+				{ command: "formats", description: "Показать доступные форматы" },
 			])
 
 			await bot.api.setMyCommands(
 				[
-					{ command: "formats", description: "Check available formats" },
+					{ command: "formats", description: "Показать доступные форматы" },
 					{ command: "cookie", description: "Upload cookies info" },
 					{ command: "clear", description: "Clear cookies" },
 				],

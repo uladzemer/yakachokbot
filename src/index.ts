@@ -1,11 +1,12 @@
-import { readdir, readFile, unlink, writeFile } from "node:fs/promises"
+import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
-import { link, t, tiktokArgs, impersonateArgs } from "./constants"
+import { link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
@@ -58,8 +59,12 @@ const spawnPromise = (
 }
 
 const safeGetInfo = async (url: string, args: string[]) => {
-	console.log("Running yt-dlp with:", args)
-	const { stdout } = await execFilePromise("yt-dlp", [url, ...args])
+	const runtimeArgs = args.includes("--js-runtimes") ? args : [...jsRuntimeArgs, ...args]
+	const runtimeArgsWithCache = runtimeArgs.includes("--no-cache-dir")
+		? runtimeArgs
+		: [...runtimeArgs, "--no-cache-dir"]
+	console.log("Running yt-dlp with:", runtimeArgsWithCache)
+	const { stdout } = await execFilePromise("yt-dlp", [url, ...runtimeArgsWithCache])
 	// Split by newline and try to parse the first valid JSON line
 	const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
 	for (const line of lines) {
@@ -69,6 +74,84 @@ const safeGetInfo = async (url: string, args: string[]) => {
 	}
 	throw new Error("No valid JSON found in yt-dlp output")
 }
+
+const fileExists = async (path: string, minSize = 1) => {
+	try {
+		const info = await stat(path)
+		return info.size >= minSize
+	} catch {
+		return false
+	}
+}
+
+const renderMhtmlPreview = async (inputPath: string, outputBase: string) => {
+	const htmlPath = `${outputBase}.html`
+	let previewSource = inputPath
+	try {
+		await execFilePromise("python3", [
+			"src/mhtml_extract.py",
+			inputPath,
+			htmlPath,
+		])
+		if (await fileExists(htmlPath, 16)) {
+			previewSource = htmlPath
+		}
+	} catch (error) {
+		console.error("MHTML HTML extract error:", error)
+	}
+
+	const fileUrl = pathToFileURL(previewSource).toString()
+	const commonArgs = [
+		"--headless",
+		"--no-sandbox",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--allow-file-access-from-files",
+		"--window-size=1280,720",
+		"--hide-scrollbars",
+		"--virtual-time-budget=5000",
+	]
+	const pngPath = `${outputBase}.png`
+	try {
+		await execFilePromise("chromium", [
+			...commonArgs,
+			`--screenshot=${pngPath}`,
+			fileUrl,
+		])
+		if (await fileExists(pngPath, 1024)) return pngPath
+	} catch (error) {
+		console.error("MHTML image render error:", error)
+	}
+
+	const pdfPath = `${outputBase}.pdf`
+	try {
+		await execFilePromise("chromium", [
+			...commonArgs,
+			`--print-to-pdf=${pdfPath}`,
+			fileUrl,
+		])
+		if (await fileExists(pdfPath, 1024)) return pdfPath
+	} catch (error) {
+		console.error("MHTML PDF render error:", error)
+	}
+
+	return undefined
+}
+
+const isYouTubeUrl = (url: string) => {
+	try {
+		return urlMatcher(url, "youtube.com") || urlMatcher(url, "youtu.be")
+	} catch {
+		return false
+	}
+}
+
+const youtubeExtractorArgs = [
+	"--extractor-args",
+	"youtube:player_client=android_sdkless,web_safari",
+]
 
 const soraMatcher = (url: string) => url.includes("sora.chatgpt.com")
 
@@ -102,7 +185,313 @@ const resolveXfree = async (url: string) => {
 
 const queue = new Queue(10)
 const updater = new Updater()
-const requestCache = new Map<string, { url: string; title?: string }>()
+type RequestCacheEntry = { url: string; title?: string; formats?: any[] }
+type FormatEntry = {
+	format: any
+	meta: {
+		hasVideo: boolean
+		hasAudio: boolean
+		vcodec: string
+		acodec: string
+		codecLabel: string
+		bitrate: string
+		isDash: boolean
+		isHls: boolean
+		isMhtml: boolean
+	}
+}
+
+const requestCache = new Map<string, RequestCacheEntry>()
+
+const getFormatMeta = (format: any): FormatEntry["meta"] => {
+	const formatText = `${format.format_note || ""}`.toLowerCase()
+	const formatLine = `${format.format || ""}`.toLowerCase()
+	const protocol = `${format.protocol || ""}`.toLowerCase()
+	const ext = `${format.ext || ""}`.toLowerCase()
+	const hasVideo = format.vcodec && format.vcodec !== "none"
+	const hasAudio = format.acodec && format.acodec !== "none"
+	const vcodec =
+		format.vcodec && format.vcodec !== "none" ? format.vcodec.split(".")[0] : "none"
+	const acodec =
+		format.acodec && format.acodec !== "none" ? format.acodec.split(".")[0] : "none"
+	const codecLabel = [hasVideo ? vcodec : "", hasAudio ? acodec : ""]
+		.filter(Boolean)
+		.join("+")
+	const bitrate =
+		typeof format.tbr === "number"
+			? `${Math.round(format.tbr)}k`
+			: typeof format.vbr === "number"
+				? `${Math.round(format.vbr)}k`
+			: typeof format.abr === "number"
+				? `${Math.round(format.abr)}k`
+				: ""
+	const isHls =
+		protocol.includes("m3u8") ||
+		protocol.includes("hls") ||
+		formatText.includes("hls") ||
+		formatLine.includes("hls")
+	const isMhtml =
+		protocol.includes("mhtml") ||
+		ext === "mhtml" ||
+		`${format.format_id || ""}`.startsWith("sb") ||
+		formatText.includes("storyboard") ||
+		formatLine.includes("storyboard")
+	const isDash =
+		format.protocol === "dash" ||
+		formatText.includes("dash") ||
+		formatLine.includes("dash") ||
+		(hasVideo && !hasAudio) ||
+		(!hasVideo && hasAudio)
+
+	return {
+		hasVideo,
+		hasAudio,
+		vcodec,
+		acodec,
+		codecLabel,
+		bitrate,
+		isDash,
+		isHls,
+		isMhtml,
+	}
+}
+
+const splitFormatEntries = (formats: any[]) => {
+	const formatEntries: FormatEntry[] = formats.map((format) => ({
+		format,
+		meta: getFormatMeta(format),
+	}))
+	const dashEntries: FormatEntry[] = []
+	const hlsEntries: FormatEntry[] = []
+	const mhtmlEntries: FormatEntry[] = []
+	for (const entry of formatEntries) {
+		if (entry.meta.isMhtml) {
+			mhtmlEntries.push(entry)
+		} else if (entry.meta.isHls) {
+			hlsEntries.push(entry)
+		} else {
+			dashEntries.push(entry)
+		}
+	}
+	return { formatEntries, dashEntries, hlsEntries, mhtmlEntries }
+}
+
+const buildFormatButtonText = (entry: FormatEntry) => {
+	const f = entry.format
+	const { codecLabel, bitrate, isDash } = entry.meta
+	const filesize = f.filesize
+		? `${(f.filesize / 1024 / 1024).toFixed(1)}MiB`
+		: f.filesize_approx
+			? `~${(f.filesize_approx / 1024 / 1024).toFixed(1)}MiB`
+			: "N/A"
+	const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "")
+
+	let buttonText = f.format_id
+	if (res) {
+		buttonText += ` ${res}`
+	} else if (f.acodec !== "none" && f.vcodec === "none") {
+		buttonText += " audio"
+	}
+	if (isDash) {
+		buttonText += " dash"
+	}
+	if (codecLabel) {
+		buttonText += ` ${codecLabel}`
+	}
+	if (bitrate) {
+		buttonText += ` ${bitrate}`
+	}
+	buttonText += ` (${filesize})`
+
+	// Truncate to 60 characters if too long
+	if (buttonText.length > 60) {
+		buttonText = `${buttonText.substring(0, 57)}...`
+	}
+	console.log("Button text:", buttonText)
+	return buttonText
+}
+
+const buildFormatsTable = (entries: FormatEntry[]) => {
+	let output =
+		"ID | EXT | RES | FPS | TBR | SIZE | VCODEC | ACODEC | PROTO | NOTE\n" +
+		"---|-----|-----|-----|-----|------|--------|--------|-------|-----\n"
+	for (const entry of entries) {
+		const f = entry.format
+		const { vcodec, acodec, bitrate } = entry.meta
+		const filesize = f.filesize
+			? `${(f.filesize / 1024 / 1024).toFixed(1)}MiB`
+			: f.filesize_approx
+				? `~${(f.filesize_approx / 1024 / 1024).toFixed(1)}MiB`
+				: "N/A"
+		const fps = f.fps ? f.fps : ""
+		const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "audio")
+		const proto = f.protocol || ""
+		const note = f.format_note || ""
+		const tbrLabel = bitrate || "N/A"
+
+		output += `${f.format_id} | ${f.ext} | ${res} | ${fps} | ${tbrLabel} | ${filesize} | ${vcodec} | ${acodec} | ${proto} | ${note}\n`
+	}
+	return output
+}
+
+const sendFormatSelector = async (
+	ctx: any,
+	requestId: string,
+	title: string,
+	dashCount: number,
+	hlsCount: number,
+	mhtmlCount: number,
+	hasMp3: boolean,
+) => {
+	const keyboard = new InlineKeyboard()
+	keyboard.text(`DASH (${dashCount})`, `f:${requestId}:dash`)
+	keyboard.text(`HLS (${hlsCount})`, `f:${requestId}:hls`).row()
+	if (hasMp3) {
+		keyboard.text("MP3", `f:${requestId}:mp3`)
+	}
+	if (mhtmlCount > 0) {
+		keyboard.text(`MHTML (${mhtmlCount})`, `f:${requestId}:mhtml`)
+	}
+
+	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	await ctx.reply(`Выберите список форматов для: ${title}`, {
+		reply_markup: keyboard,
+		message_thread_id: threadId,
+	})
+}
+
+const sendFormatSection = async (
+	ctx: any,
+	requestId: string,
+	title: string,
+	label: string,
+	entries: FormatEntry[],
+	allowCombine = true,
+) => {
+	if (entries.length === 0) {
+		await ctx.reply(`No ${label} formats found.`)
+		return
+	}
+
+	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	if (entries.length > 100) {
+		const output = `${label} formats\n${buildFormatsTable(entries)}`
+		const buffer = Buffer.from(output.trim(), "utf-8")
+		await ctx.replyWithDocument(new InputFile(buffer, "formats.txt"), {
+			caption: `Too many ${label} formats. Available formats for: ${title}`,
+			message_thread_id: threadId,
+		})
+		const keyboard = new InlineKeyboard()
+		if (allowCombine) {
+			keyboard.text("Объединить форматы", `c:${requestId}`).row()
+		}
+		keyboard.text("Назад", `f:${requestId}:back`).row()
+		await ctx.reply(`Actions for: ${title}`, {
+			reply_markup: keyboard,
+			message_thread_id: threadId,
+		})
+		return
+	}
+
+	const keyboard = new InlineKeyboard()
+	if (allowCombine) {
+		keyboard.text("Объединить форматы", `c:${requestId}`).row()
+	}
+	for (const entry of entries) {
+		keyboard
+			.text(buildFormatButtonText(entry), `d:${requestId}:${entry.format.format_id}`)
+			.row()
+	}
+	keyboard.text("Назад", `f:${requestId}:back`).row()
+	await ctx.reply(`Select ${label} format for: ${title}`, {
+		reply_markup: keyboard,
+		message_thread_id: threadId,
+	})
+}
+
+const sendCombineVideoSection = async (
+	ctx: any,
+	requestId: string,
+	title: string,
+	entries: FormatEntry[],
+) => {
+	if (entries.length === 0) {
+		await ctx.reply("No video-only formats available to combine.")
+		return
+	}
+	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	if (entries.length > 100) {
+		const output = `Video-only formats\n${buildFormatsTable(entries)}`
+		const buffer = Buffer.from(output.trim(), "utf-8")
+		await ctx.replyWithDocument(new InputFile(buffer, "formats.txt"), {
+			caption: `Too many video formats. Available formats for: ${title}`,
+			message_thread_id: threadId,
+		})
+		const keyboard = new InlineKeyboard()
+		keyboard.text("Назад", `f:${requestId}:dash`).row()
+		await ctx.reply("Actions for combine:", {
+			reply_markup: keyboard,
+			message_thread_id: threadId,
+		})
+		return
+	}
+
+	const keyboard = new InlineKeyboard()
+	for (const entry of entries) {
+		keyboard
+			.text(buildFormatButtonText(entry), `cv:${requestId}:${entry.format.format_id}`)
+			.row()
+	}
+	keyboard.text("Назад", `f:${requestId}:dash`).row()
+	await ctx.reply(`Select video format to combine for: ${title}`, {
+		reply_markup: keyboard,
+		message_thread_id: threadId,
+	})
+}
+
+const sendCombineAudioSection = async (
+	ctx: any,
+	requestId: string,
+	title: string,
+	videoId: string,
+	entries: FormatEntry[],
+) => {
+	if (entries.length === 0) {
+		await ctx.reply("No audio-only formats available to combine.")
+		return
+	}
+	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	if (entries.length > 100) {
+		const output = `Audio-only formats\n${buildFormatsTable(entries)}`
+		const buffer = Buffer.from(output.trim(), "utf-8")
+		await ctx.replyWithDocument(new InputFile(buffer, "formats.txt"), {
+			caption: `Too many audio formats. Available formats for: ${title}`,
+			message_thread_id: threadId,
+		})
+		const keyboard = new InlineKeyboard()
+		keyboard.text("Назад", `c:${requestId}`).row()
+		await ctx.reply("Actions for combine:", {
+			reply_markup: keyboard,
+			message_thread_id: threadId,
+		})
+		return
+	}
+
+	const keyboard = new InlineKeyboard()
+	for (const entry of entries) {
+		keyboard
+			.text(
+				buildFormatButtonText(entry),
+				`ca:${requestId}:${videoId}:${entry.format.format_id}`,
+			)
+			.row()
+	}
+	keyboard.text("Назад", `c:${requestId}`).row()
+	await ctx.reply(`Select audio format to combine for: ${title}`, {
+		reply_markup: keyboard,
+		message_thread_id: threadId,
+	})
+}
 
 const downloadAndSend = async (
 	ctx: any,
@@ -113,17 +502,31 @@ const downloadAndSend = async (
 	overrideTitle?: string,
 	replyToMessageId?: number,
 ) => {
-	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
-	const tempThumbPath = resolve("/tmp", `${randomUUID()}.jpg`)
+	const tempBaseId = randomUUID()
+	const tempDir = resolve("/tmp", `telegram-ytdl-${tempBaseId}`)
+	await mkdir(tempDir, { recursive: true })
+	let tempFilePath = resolve(tempDir, "video.mp4")
+	const tempThumbPath = resolve(tempDir, "thumb.jpg")
+	const tempPreviewBase = resolve(tempDir, "preview")
 	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
 	
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
+		const isInstagram =
+			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const additionalArgs = isTiktok ? tiktokArgs : []
+		const isYouTube = isYouTubeUrl(url)
+		const cookieArgsList = isYouTube ? [] : await cookieArgs()
+		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
+		const isMp3Format = isRawFormat && quality === "mp3"
 		let formatArgs: string[] = []
 		if (isRawFormat) {
-			formatArgs = ["-f", quality]
+			if (isMp3Format) {
+				formatArgs = ["-f", "251", "-x", "--audio-format", "mp3"]
+			} else {
+				formatArgs = ["-f", quality]
+			}
 		} else if (quality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
 		} else if (quality === "b") {
@@ -141,7 +544,7 @@ const downloadAndSend = async (
 		console.log(`[QUEUE] Starting download: ${url} (Quality: ${quality}) in chat ${ctx.chat.id}`)
 
 		if (statusMessageId) {
-			await updateMessage(ctx, statusMessageId, "Fetching video info...")
+			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
 		}
 
 		const info = await safeGetInfo(url, [
@@ -149,31 +552,119 @@ const downloadAndSend = async (
 			...formatArgs,
 			"--no-warnings",
 			"--no-playlist",
-			...(await cookieArgs()),
+			...cookieArgsList,
 			...additionalArgs,
 			...impersonateArgs,
+			...youtubeArgs,
 		])
 
 		const title = overrideTitle || removeHashtagsMentions(info.title)
 		const caption = link(title || "Video", cleanUrl(url))
-
-		if (quality !== "audio") {
-			const vcodec = info.vcodec || ""
-			const isGoodCodec = /avc|h264|hevc|h265/i.test(vcodec)
-
-			if (!isGoodCodec) {
-				formatArgs.push("--recode-video", "mp4")
-			} else {
-				formatArgs.push("--merge-output-format", "mp4")
+		const maxUploadSize = 2 * 1024 * 1024 * 1024
+		const sizeCandidates: number[] = []
+		if (typeof info.filesize === "number") sizeCandidates.push(info.filesize)
+		if (typeof info.filesize_approx === "number")
+			sizeCandidates.push(info.filesize_approx)
+		if (Array.isArray(info.requested_formats)) {
+			let summed = 0
+			let hasSize = false
+			for (const format of info.requested_formats) {
+				const formatSize =
+					typeof format?.filesize === "number"
+						? format.filesize
+						: typeof format?.filesize_approx === "number"
+							? format.filesize_approx
+							: 0
+				if (formatSize > 0) {
+					summed += formatSize
+					hasSize = true
+				}
 			}
+			if (hasSize) sizeCandidates.push(summed)
+		}
+		const estimatedSize = sizeCandidates.length
+			? Math.max(...sizeCandidates)
+			: 0
+		if (estimatedSize >= maxUploadSize) {
+			const limitMessage = "Можно загрузить файлы до 2ГБ"
+			if (statusMessageId) {
+				await updateMessage(ctx, statusMessageId, limitMessage)
+			} else if (ctx.callbackQuery) {
+				await ctx.editMessageText(limitMessage)
+			} else {
+				await ctx.reply(limitMessage)
+			}
+			return
 		}
 
-		if (quality === "audio") {
+		const requestedFormats = Array.isArray(info.requested_formats)
+			? info.requested_formats
+			: []
+		const isCombined = isRawFormat && requestedFormats.length > 1
+		let outputContainer: "mp4" | "webm" | "mkv" = "mp4"
+		const formatNote = `${info.format_note || ""}`.toLowerCase()
+		const formatLine = `${info.format || ""}`.toLowerCase()
+		const formatProtocol = `${info.protocol || ""}`.toLowerCase()
+		const isMhtml =
+			info.ext === "mhtml" ||
+			`${info.format_id || ""}`.startsWith("sb") ||
+			formatProtocol.includes("mhtml") ||
+			formatNote.includes("storyboard") ||
+			formatLine.includes("storyboard")
+
+		if (quality !== "audio" && !isMp3Format) {
+			const vcodec = info.vcodec || ""
+			const acodec = info.acodec || ""
+			let combinedVideoCodec = vcodec
+			let combinedAudioCodec = acodec
+			if (isMhtml) {
+				outputContainer = "mhtml"
+			} else if (isCombined) {
+				const videoFormat = requestedFormats.find(
+					(f: any) => f.vcodec && f.vcodec !== "none",
+				)
+				const audioFormat = requestedFormats.find(
+					(f: any) => f.acodec && f.acodec !== "none",
+				)
+				combinedVideoCodec = videoFormat?.vcodec || vcodec
+				combinedAudioCodec = audioFormat?.acodec || acodec
+				const isWebmVideo = /vp0?8|vp0?9|av01/i.test(combinedVideoCodec)
+				const isWebmAudio = /opus|vorbis/i.test(combinedAudioCodec)
+				const isMp4Video = /avc|h264|hevc|h265/i.test(combinedVideoCodec)
+				const isMp4Audio = /mp4a|aac/i.test(combinedAudioCodec)
+
+				if (isWebmVideo && isWebmAudio) {
+					outputContainer = "webm"
+				} else if (isMp4Video && isMp4Audio) {
+					outputContainer = "mp4"
+				} else {
+					outputContainer = "mkv"
+				}
+				if (isInstagram) {
+					outputContainer = "mp4"
+				}
+			} else {
+				outputContainer = info.ext === "webm" ? "webm" : info.ext === "mkv" ? "mkv" : "mp4"
+			}
+
+			if (outputContainer !== "mp4") {
+				tempFilePath = resolve(tempDir, `video.${outputContainer}`)
+			}
+
+			if (!isMhtml) {
+				formatArgs.push("--merge-output-format", outputContainer)
+			}
+		}
+		if (!formatArgs.includes("--no-cache-dir")) {
+			formatArgs.push("--no-cache-dir")
+		}
+
+		if (quality === "audio" || isMp3Format) {
 			if (statusMessageId) {
 				await updateMessage(
 					ctx,
 					statusMessageId,
-					`Processing: <b>${title}</b>\nStatus: Downloading audio...`,
+					`Обработка: <b>${title}</b>\nСтатус: Скачиваем аудио...`,
 				)
 			}
 			const stream = downloadFromInfo(info, "-", formatArgs)
@@ -183,7 +674,7 @@ const downloadAndSend = async (
 				await updateMessage(
 					ctx,
 					statusMessageId,
-					`Processing: <b>${title}</b>\nStatus: Uploading...`,
+					`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 				)
 			}
 			await ctx.replyWithChatAction("upload_voice")
@@ -207,73 +698,198 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		} else {
-			let progressText = "Downloading..."
+			let progressText = "Скачиваем..."
+			let fileSize = ""
+			let lastProgressAt = Date.now()
+			const containerLabel = outputContainer.toUpperCase()
+			const muxingLabel = `Муксинг в ${containerLabel}...`
+			const convertingLabel = `Конвертируем в ${containerLabel}...`
 			const onProgress = (data: string) => {
 				if (!statusMessageId) return
+				const lower = data.toLowerCase()
+				lastProgressAt = Date.now()
 
-				if (data.includes("[download]") && data.includes("%")) {
-					const match = data.match(/(\d+\.\d+)%/)
-					if (match) progressText = `Downloading: ${match[1]}%`
-				} else if (data.includes("[Merger]")) {
-					progressText = "Merging audio and video..."
-				} else if (data.includes("[VideoConvertor]")) {
-					progressText = "Converting to MP4..."
+				if (data.includes("[download]")) {
+					const sizeMatch = data.match(/of\s+(?:~?\s*)?([\d.,]+\s*\w+B)/)
+					if (sizeMatch?.[1]) {
+						fileSize = sizeMatch[1]
+					}
+
+					const percentageMatch = data.match(/(\d+(?:[.,]\d+)?)%/)
+					if (percentageMatch) {
+						progressText = `Скачиваем: ${percentageMatch[1]}%`
+						if (fileSize) {
+							progressText += ` из ${fileSize}`
+						}
+						if (percentageMatch[1] === "100.0" && isCombined) {
+							progressText = muxingLabel
+						}
+					}
+				} else if (
+					data.includes("[Merger]") ||
+					lower.includes("merging formats into") ||
+					(lower.includes("[ffmpeg]") && lower.includes("merge"))
+				) {
+					progressText = muxingLabel
+				} else if (
+					data.includes("[VideoConvertor]") ||
+					lower.includes("converting") ||
+					(lower.includes("[ffmpeg]") && lower.includes("conversion"))
+				) {
+					progressText = convertingLabel
 				}
 
 				updateMessage(
 					ctx,
 					statusMessageId,
-					`Processing: <b>${title}</b>\nStatus: ${progressText}`,
+					`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
 				)
 			}
 
-			await spawnPromise(
-				"yt-dlp",
-				[
-					url,
-					...formatArgs,
-					"-o",
-					tempFilePath,
-					"--no-warnings",
-					"--no-playlist",
-					...(await cookieArgs()),
-					...additionalArgs,
-					...impersonateArgs,
-				],
-				onProgress,
-			)
-
-			// Get metadata directly from the file
-			const metadata = await getVideoMetadata(tempFilePath)
-			const width = metadata.width || info.width
-			const height = metadata.height || info.height
-			const duration = metadata.duration || info.duration
-
-			// Generate local thumbnail to ensure correct aspect ratio in Telegram
-			await generateThumbnail(tempFilePath, tempThumbPath)
-			const thumbFile = new InputFile(tempThumbPath)
-
-			const video = new InputFile(tempFilePath)
-
+			let statusHeartbeat: NodeJS.Timeout | undefined
 			if (statusMessageId) {
-				await updateMessage(
-					ctx,
-					statusMessageId,
-					`Processing: <b>${title}</b>\nStatus: Uploading...`,
-				)
+				statusHeartbeat = setInterval(() => {
+					const isStale = Date.now() - lastProgressAt > 15000
+					if (!isStale) return
+					updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: ${progressText} (все еще работаем)`,
+					)
+				}, 15000)
 			}
 
-			await ctx.replyWithChatAction("upload_video")
-			await ctx.replyWithVideo(video, {
-				caption,
-				parse_mode: "HTML",
-				supports_streaming: true,
-				duration,
-				width,
-				height,
-				thumbnail: thumbFile,
-				message_thread_id: threadId,
-			})
+			try {
+				await spawnPromise(
+					"yt-dlp",
+					[
+						url,
+						...formatArgs,
+						"-o",
+						tempFilePath,
+						"--no-warnings",
+						"--no-playlist",
+						...cookieArgsList,
+						...additionalArgs,
+						...impersonateArgs,
+						...youtubeArgs,
+					],
+					onProgress,
+				)
+			} finally {
+				if (statusHeartbeat) clearInterval(statusHeartbeat)
+			}
+
+			const hasVideoTrack = info.vcodec && info.vcodec !== "none"
+			if (
+				(isTiktok || isInstagram) &&
+				hasVideoTrack &&
+				!isMhtml &&
+				outputContainer === "mp4" &&
+				!isMp3Format &&
+				quality !== "audio"
+			) {
+				const audioFixedPath = resolve(tempDir, "audio-fixed.mp4")
+				try {
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: Конвертируем аудио...`,
+						)
+					}
+					await spawnPromise("ffmpeg", [
+						"-y",
+						"-i",
+						tempFilePath,
+						"-c:v",
+						"copy",
+						"-c:a",
+						"aac",
+						"-profile:a",
+						"aac_low",
+						"-b:a",
+						"256k",
+						"-ar",
+						"48000",
+						"-movflags",
+						"+faststart",
+						audioFixedPath,
+					])
+					if (await fileExists(audioFixedPath, 1024)) {
+						await unlink(tempFilePath)
+						tempFilePath = audioFixedPath
+					} else {
+						await unlink(audioFixedPath)
+					}
+				} catch (error) {
+					console.error("TikTok audio convert error:", error)
+					try {
+						await unlink(audioFixedPath)
+					} catch {}
+				}
+			}
+
+			if (isMhtml) {
+				try {
+					const previewPath = await renderMhtmlPreview(tempFilePath, tempPreviewBase)
+					if (previewPath) {
+						await ctx.replyWithChatAction("upload_document")
+						await ctx.replyWithDocument(new InputFile(previewPath), {
+							caption: "Preview",
+							message_thread_id: threadId,
+						})
+					}
+				} catch (error) {
+					console.error("MHTML preview send error:", error)
+				}
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+					)
+				}
+				await ctx.replyWithChatAction("upload_document")
+				await ctx.replyWithDocument(new InputFile(tempFilePath), {
+					caption,
+					parse_mode: "HTML",
+					message_thread_id: threadId,
+				})
+			} else {
+				// Get metadata directly from the file
+				const metadata = await getVideoMetadata(tempFilePath)
+				const width = metadata.width || info.width
+				const height = metadata.height || info.height
+				const duration = metadata.duration || info.duration
+
+				// Generate local thumbnail to ensure correct aspect ratio in Telegram
+				await generateThumbnail(tempFilePath, tempThumbPath)
+				const thumbFile = new InputFile(tempThumbPath)
+
+				const video = new InputFile(tempFilePath)
+
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+					)
+				}
+
+				await ctx.replyWithChatAction("upload_video")
+				const supportsStreaming = outputContainer === "mp4" && !isTiktok
+				await ctx.replyWithVideo(video, {
+					caption,
+					parse_mode: "HTML",
+					supports_streaming: supportsStreaming,
+					duration,
+					width,
+					height,
+					thumbnail: thumbFile,
+					message_thread_id: threadId,
+				})
+			}
 
 			if (statusMessageId) {
 				try {
@@ -300,8 +916,7 @@ const downloadAndSend = async (
 		}
 	} finally {
 		try {
-			await unlink(tempFilePath)
-			await unlink(tempThumbPath)
+			await rm(tempDir, { recursive: true, force: true })
 		} catch {}
 	}
 }
@@ -352,20 +967,16 @@ bot.on("message:document", async (ctx) => {
 		return
 	}
 
-	const processing = await ctx.reply("Updating cookies...")
+	const processing = await ctx.reply("Обновляем cookies...")
 	try {
 		const file = await ctx.api.getFile(doc.file_id)
+		if (!file.file_path) {
+			throw new Error("File path not available from Telegram API.")
+		}
 		const absPath = resolve("/var/lib/telegram-bot-api", bot.token, file.file_path)
 		const newContent = await readFile(absPath, "utf-8")
 
-		let currentContent = ""
-		try {
-			currentContent = await readFile(COOKIE_FILE, "utf-8")
-		} catch {}
-
-		// Ensure there's a newline between old and new content
-		const separator = currentContent.length > 0 && !currentContent.endsWith("\n") ? "\n" : ""
-		await writeFile(COOKIE_FILE, currentContent + separator + newContent)
+		await writeFile(COOKIE_FILE, newContent)
 		
 		await ctx.reply(`Cookies appended successfully!\nLocation: ${COOKIE_FILE}`)
 	} catch (error) {
@@ -400,83 +1011,89 @@ bot.on("message:text", async (ctx, next) => {
 	await next()
 })
 
+const userState = new Map<number, string>()
+
 bot.command("formats", async (ctx) => {
-	const args = ctx.match?.split(/\s+/)
-	const url = args?.[0]
-	const requestedFormat = args?.[1]
-
-	if (!url) {
-		return ctx.reply("Usage: /formats <url> [format_id]\nExample: /formats <url> 137+140")
+	if (ctx.from?.id) {
+		userState.set(ctx.from.id, "waiting_for_formats_url")
+		await ctx.reply("Пришлите ссылку.")
 	}
+})
 
-	if (requestedFormat) {
-		const processing = await ctx.reply(
-			`Queuing download for format: ${requestedFormat}...`,
-		)
-		queue.add(async () => {
-			await downloadAndSend(
-				ctx,
-				url,
-				requestedFormat,
-				true,
-				processing.message_id,
-				undefined,
-				ctx.message.message_id,
-			)
-		})
-		return
-	}
+bot.on("message:text", async (ctx, next) => {
+	const userId = ctx.from?.id
+	if (!userId) return await next()
 
-	const processing = await ctx.reply("Fetching formats...")
-	try {
-		const info = await safeGetInfo(url, ["--dump-json", "--no-warnings", "--no-playlist", ...(await cookieArgs())])
-
-		if (!info.formats || info.formats.length === 0) {
-			await ctx.reply("No formats found.")
+	const state = userState.get(userId)
+	if (state === "waiting_for_formats_url") {
+		userState.delete(userId)
+		const url = ctx.message.text
+		if (!url) {
+			await ctx.reply("Invalid URL.")
 			return
 		}
 
-		// Header
-		let output =
-			"ID | EXT | RES | FPS | SIZE | VCODEC | ACODEC\n" +
-			"---|-----|-----|-----|------|--------|-------\n"
+						const processing = await ctx.reply("Получаем форматы...")
+						try {
+						const isYouTube = isYouTubeUrl(url)
+						const cookieArgsList = isYouTube ? [] : await cookieArgs()
+						const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+						const additionalArgs = urlMatcher(url, "tiktok.com") ? tiktokArgs : []
+						const info = await safeGetInfo(url, [
+							"--dump-json",
+							"--no-warnings",
+							"--no-playlist",
+							...cookieArgsList,
+							...additionalArgs,
+							...impersonateArgs,
+							...youtubeArgs,
+						])
+			
+						if (!info.formats || info.formats.length === 0) {
+							await ctx.reply("No formats found.")
+							return
+						}
+						const formats = info.formats || []
+			
+						const requestId = randomUUID().split("-")[0]
+						if (!requestId) {
+							throw new Error("Failed to generate request ID.")
+						}
+						const filteredFormats = formats.filter((f) => f.format_id)
+						requestCache.set(requestId, {
+							url,
+							title: info.title,
+							formats: filteredFormats,
+						})
+						// Expire cache after 1 hour
+						setTimeout(() => requestCache.delete(requestId), 3600000)
 
-		// Rows
-		for (const f of info.formats) {
-			const filesize = f.filesize
-				? `${(f.filesize / 1024 / 1024).toFixed(1)}MiB`
-				: f.filesize_approx
-					? `~${(f.filesize_approx / 1024 / 1024).toFixed(1)}MiB`
-					: "N/A"
+						console.log(`[DEBUG] Total formats: ${formats.length}`)
+						console.log(`[DEBUG] Filtered formats count: ${filteredFormats.length}`)
+						console.log(
+							`[DEBUG] Filtered format IDs: ${filteredFormats.map((f) => f.format_id).join(", ")}`,
+						)
 
-			const vcodec =
-				f.vcodec && f.vcodec !== "none"
-					? f.vcodec.split(".")[0]
-					: f.acodec !== "none"
-						? "audio"
-						: "none"
+						const { dashEntries, hlsEntries, mhtmlEntries } =
+							splitFormatEntries(filteredFormats)
+						const hasMp3 = filteredFormats.some((f) => f.format_id === "251")
 
-			const acodec =
-				f.acodec && f.acodec !== "none" ? f.acodec.split(".")[0] : "none"
-
-			const fps = f.fps ? f.fps : ""
-			const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "audio")
-
-			output += `${f.format_id} | ${f.ext} | ${res} | ${fps} | ${filesize} | ${vcodec} | ${acodec}\n`
+						await sendFormatSelector(
+							ctx,
+							requestId,
+							info.title,
+							dashEntries.length,
+							hlsEntries.length,
+							mhtmlEntries.length,
+							hasMp3,
+						)
+		} catch (error) {
+			await ctx.reply(`Error: ${error instanceof Error ? error.message : "Unknown"}`)
+		} finally {
+			await deleteMessage(processing)
 		}
-
-		if (output.length > 4000) {
-			const buffer = Buffer.from(output, "utf-8")
-			await ctx.replyWithDocument(new InputFile(buffer, "formats.txt"), {
-				caption: `Available formats for: ${info.title}`,
-			})
-		} else {
-			await ctx.replyWithHTML(`<pre>${output}</pre>`)
-		}
-	} catch (error) {
-		await ctx.reply(`Error: ${error instanceof Error ? error.message : "Unknown"}`)
-	} finally {
-		await deleteMessage(processing)
+	} else {
+		await next()
 	}
 })
 
@@ -549,17 +1166,27 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			}
 
 			if (resolved.status === "redirect" || resolved.status === "tunnel") {
-				queue.add(async () => {
-					await downloadAndSend(
-						ctx,
-						resolved.url,
-						"b",
-						false,
-						processingMessage?.message_id,
-						"Instagram Video", // Default title if Cobalt doesn't provide one
-						ctx.message.message_id,
-					)
-				})
+				const caption = link(
+					"Instagram", // Default title if Cobalt doesn't provide one
+					cleanUrl(url.text),
+				)
+				const response = await fetch(resolved.url)
+				const buffer = await response.arrayBuffer()
+				const inputFile = new InputFile(new Uint8Array(buffer), resolved.filename)
+
+				if (resolved.filename.endsWith(".mp4")) {
+					await ctx.replyWithVideo(inputFile, {
+						caption,
+						parse_mode: "HTML",
+						message_thread_id: threadId,
+					})
+				} else {
+					await ctx.replyWithPhoto(inputFile, {
+						caption,
+						parse_mode: "HTML",
+						message_thread_id: threadId,
+					})
+				}
 				return true
 			}
 		} catch (error) {
@@ -597,6 +1224,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const isTiktok = urlMatcher(url.text, "tiktok.com")
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
+		const isYouTube = isYouTubeUrl(url.text)
+		const cookieArgsList = isYouTube ? [] : await cookieArgs()
+		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
 		if (useCobalt && !isSora) {
 			if (await useCobaltResolver()) {
@@ -611,9 +1241,10 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			"-q",
 			"--no-progress",
 			"--no-playlist",
-			...(await cookieArgs()),
+			...cookieArgsList,
 			...additionalArgs,
 			...impersonateArgs,
+			...youtubeArgs,
 		])
 
 		const title = bypassTitle || removeHashtagsMentions(info.title)
@@ -636,6 +1267,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 
 		const requestId = randomUUID().split("-")[0]
+		if (!requestId) {
+			throw new Error("Failed to generate request ID")
+		}
 		requestCache.set(requestId, { url: url.text, title })
 		// Expire cache after 1 hour
 		setTimeout(() => requestCache.delete(requestId), 3600000)
@@ -693,9 +1327,194 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 bot.on("callback_query:data", async (ctx) => {
 	const data = ctx.callbackQuery.data
+	if (data.startsWith("f:")) {
+		const [, requestId, listType] = data.split(":")
+		if (!requestId || !listType) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid request.",
+				show_alert: true,
+			})
+		}
+		const cached = requestCache.get(requestId)
+		if (!cached?.formats) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return
+		}
+
+		const { dashEntries, hlsEntries, mhtmlEntries } =
+			splitFormatEntries(cached.formats)
+		if (listType === "dash") {
+			await sendFormatSection(
+				ctx,
+				requestId,
+				cached.title || "video",
+				"DASH",
+				dashEntries,
+				true,
+			)
+		} else if (listType === "hls") {
+			await sendFormatSection(
+				ctx,
+				requestId,
+				cached.title || "video",
+				"HLS",
+				hlsEntries,
+				false,
+			)
+		} else if (listType === "mhtml") {
+			await sendFormatSection(
+				ctx,
+				requestId,
+				cached.title || "video",
+				"MHTML",
+				mhtmlEntries,
+				false,
+			)
+		} else if (listType === "mp3") {
+			const hasMp3 = cached.formats.some((f) => f.format_id === "251")
+			if (!hasMp3) {
+				await ctx.answerCallbackQuery({
+					text: "MP3 source not available.",
+					show_alert: true,
+				})
+				return
+			}
+			const processing = await ctx.reply("Ставим в очередь MP3...")
+			queue.add(async () => {
+				await downloadAndSend(
+					ctx,
+					cached.url,
+					"mp3",
+					true,
+					processing.message_id,
+					cached.title,
+					ctx.callbackQuery.message?.message_id,
+				)
+			})
+			return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
+		} else if (listType === "back") {
+			const hasMp3 = cached.formats.some((f) => f.format_id === "251")
+			await sendFormatSelector(
+				ctx,
+				requestId,
+				cached.title || "video",
+				dashEntries.length,
+				hlsEntries.length,
+				mhtmlEntries.length,
+				hasMp3,
+			)
+		} else {
+			await ctx.answerCallbackQuery({
+				text: "Unknown list type.",
+				show_alert: true,
+			})
+			return
+		}
+
+		return await ctx.answerCallbackQuery()
+	}
+	if (data.startsWith("c:")) {
+		const [, requestId] = data.split(":")
+		if (!requestId) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid request.",
+				show_alert: true,
+			})
+		}
+		const cached = requestCache.get(requestId)
+		if (!cached) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return await ctx.deleteMessage()
+		}
+		const { dashEntries } = splitFormatEntries(cached.formats || [])
+		const videoEntries = dashEntries.filter(
+			(entry) => entry.meta.hasVideo && !entry.meta.hasAudio,
+		)
+		await sendCombineVideoSection(
+			ctx,
+			requestId,
+			cached.title || "video",
+			videoEntries,
+		)
+		return await ctx.answerCallbackQuery()
+	}
+	if (data.startsWith("cv:")) {
+		const [, requestId, videoId] = data.split(":")
+		if (!requestId || !videoId) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid request.",
+				show_alert: true,
+			})
+		}
+		const cached = requestCache.get(requestId)
+		if (!cached?.formats) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return await ctx.deleteMessage()
+		}
+		const { dashEntries } = splitFormatEntries(cached.formats)
+		const audioEntries = dashEntries.filter(
+			(entry) => entry.meta.hasAudio && !entry.meta.hasVideo,
+		)
+		await sendCombineAudioSection(
+			ctx,
+			requestId,
+			cached.title || "video",
+			videoId,
+			audioEntries,
+		)
+		return await ctx.answerCallbackQuery()
+	}
+	if (data.startsWith("ca:")) {
+		const [, requestId, videoId, audioId] = data.split(":")
+		if (!requestId || !videoId || !audioId) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid request.",
+				show_alert: true,
+			})
+		}
+		const cached = requestCache.get(requestId)
+		if (!cached?.formats) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return await ctx.deleteMessage()
+		}
+		const formatString = `${videoId}+${audioId}`
+		const processing = await ctx.reply(
+			`Ставим в очередь формат: ${formatString}...`,
+		)
+		queue.add(async () => {
+			await downloadAndSend(
+				ctx,
+				cached.url,
+				formatString,
+				true,
+				processing.message_id,
+				cached.title,
+				ctx.callbackQuery.message?.message_id,
+			)
+		})
+		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
+	}
 	if (!data.startsWith("d:")) return await ctx.answerCallbackQuery()
 
 	const [, requestId, quality] = data.split(":")
+	if (!requestId || !quality) {
+		return await ctx.answerCallbackQuery({
+			text: "Invalid request.",
+			show_alert: true,
+		})
+	}
 	const cached = requestCache.get(requestId)
 
 	if (!cached) {
@@ -714,17 +1533,19 @@ bot.on("callback_query:data", async (ctx) => {
 		return await ctx.deleteMessage()
 	}
 
-	await ctx.answerCallbackQuery({ text: "Queued for download..." })
+	await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
 	await ctx.editMessageText(
-		`Downloading ${quality === "b" ? "Best" : quality}...`,
+		`Скачиваем ${quality === "b" ? "Лучшее" : quality}...`,
 	)
 
+	const predefinedQualities = ["b", "2160", "1440", "1080", "720", "480", "audio"]
+	const isRawFormat = !predefinedQualities.includes(quality)
 	queue.add(async () => {
 		await downloadAndSend(
 			ctx,
 			url,
 			quality,
-			false,
+			isRawFormat,
 			ctx.callbackQuery.message?.message_id,
 			title,
 			ctx.callbackQuery.message?.reply_to_message?.message_id,
@@ -751,3 +1572,4 @@ bot.on("message:text", async (ctx) => {
 		)
 	}
 })
+

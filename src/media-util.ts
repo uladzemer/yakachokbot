@@ -29,7 +29,7 @@ export const getVideoMetadata = async (filePath: string) => {
 		if (!stream) return {}
 
 		let width = Number(stream.width)
-		let height = Number(stream.height)
+		const height = Number(stream.height)
 		const duration = stream.duration ? Math.ceil(Number(stream.duration)) : undefined
 
 		// Handle Sample Aspect Ratio (SAR) if present (e.g. "16:9", "64:45")
