@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
 import { InlineKeyboard, InputFile } from "grammy"
-import { deleteMessage, errorMessage } from "./bot-util"
+import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
 import { link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
 import {
@@ -184,8 +184,139 @@ const resolveXfree = async (url: string) => {
 }
 
 const queue = new Queue(10)
+const MAX_GLOBAL_TASKS = 10
+const MAX_USER_URLS = 3
+type JobMeta = { id: string; userId: number; url: string; lockId: string }
+const jobMeta = new Map<string, JobMeta>()
+type UrlLockState = { lockId: string; state: "reserved" | "active" }
+const userUrlLocks = new Map<number, Map<string, UrlLockState>>()
+
+const normalizeUrl = (url: string) => cleanUrl(url).trim()
+
+const lockUserUrl = (userId: number, url: string) => {
+	const normalized = normalizeUrl(url)
+	const current = userUrlLocks.get(userId) ?? new Map<string, UrlLockState>()
+	const existing = current.get(normalized)
+	if (existing) {
+		return { ok: false, normalized, lockId: existing.lockId }
+	}
+	const lockId = randomUUID()
+	current.set(normalized, { lockId, state: "reserved" })
+	userUrlLocks.set(userId, current)
+	return { ok: true, normalized, lockId }
+}
+
+const activateUserUrlLock = (userId: number, url: string, lockId: string) => {
+	const normalized = normalizeUrl(url)
+	const current = userUrlLocks.get(userId)
+	if (!current) return
+	const existing = current.get(normalized)
+	if (!existing || existing.lockId !== lockId) return
+	current.set(normalized, { lockId, state: "active" })
+}
+
+const unlockUserUrl = (userId: number, url: string, lockId?: string) => {
+	const normalized = normalizeUrl(url)
+	const current = userUrlLocks.get(userId)
+	if (!current) return
+	const existing = current.get(normalized)
+	if (!existing) return
+	if (lockId && existing.lockId !== lockId) return
+	current.delete(normalized)
+	if (current.size === 0) userUrlLocks.delete(userId)
+}
+
+const getUserUrlSet = (userId: number) => {
+	return new Set(userUrlLocks.get(userId)?.keys() ?? [])
+}
+
+const getQueueBlockReason = (userId: number, url: string, lockId?: string) => {
+	if (jobMeta.size >= MAX_GLOBAL_TASKS) {
+		return "Слишком много задач на сервере. Попробуйте позже."
+	}
+	const normalized = normalizeUrl(url)
+	const existingLock = userUrlLocks.get(userId)?.get(normalized)
+	if (existingLock) {
+		if (existingLock.lockId !== lockId) {
+			return "Эта ссылка уже в обработке. Дождитесь завершения."
+		}
+		if (existingLock.state === "active") {
+			return "Эта ссылка уже в обработке. Дождитесь завершения."
+		}
+	}
+	const userUrls = getUserUrlSet(userId)
+	if (!existingLock && userUrls.size >= MAX_USER_URLS) {
+		return "Можно одновременно обрабатывать не более 3 разных ссылок."
+	}
+	return undefined
+}
+
+const enqueueJob = (
+	userId: number,
+	url: string,
+	lockId: string,
+	executor: () => Promise<void>,
+) => {
+	const normalized = normalizeUrl(url)
+	const jobId = randomUUID()
+	jobMeta.set(jobId, { id: jobId, userId, url: normalized, lockId })
+	activateUserUrlLock(userId, normalized, lockId)
+	queue.add(async () => {
+		try {
+			await executor()
+		} finally {
+			jobMeta.delete(jobId)
+			unlockUserUrl(userId, normalized, lockId)
+		}
+	}, jobId)
+	return jobId
+}
+
+const cancelUserJobs = (userId: number) => {
+	const removed = queue.remove((entry) => jobMeta.get(entry.id)?.userId === userId)
+	for (const entry of removed) {
+		const meta = jobMeta.get(entry.id)
+		if (meta) {
+			unlockUserUrl(meta.userId, meta.url, meta.lockId)
+			jobMeta.delete(entry.id)
+		}
+	}
+	const remainingActive = Array.from(jobMeta.values()).filter(
+		(job) => job.userId === userId,
+	).length
+	return { removedCount: removed.length, remainingActive }
+}
+
+const cancelUserRequests = (userId: number) => {
+	let removed = 0
+	for (const [requestId, cached] of requestCache.entries()) {
+		if (cached.userId === userId) {
+			requestCache.delete(requestId)
+			if (cached.lockId) unlockUserUrl(userId, cached.url, cached.lockId)
+			removed++
+		}
+	}
+	return removed
+}
+
+const scheduleRequestExpiry = (requestId: string) => {
+	setTimeout(() => {
+		const cached = requestCache.get(requestId)
+		if (!cached) return
+		requestCache.delete(requestId)
+		if (cached.userId && cached.lockId) {
+			unlockUserUrl(cached.userId, cached.url, cached.lockId)
+		}
+	}, 3600000)
+}
 const updater = new Updater()
-type RequestCacheEntry = { url: string; title?: string; formats?: any[] }
+type RequestCacheEntry = {
+	url: string
+	title?: string
+	formats?: any[]
+	userId?: number
+	lockId?: string
+}
 type FormatEntry = {
 	format: any
 	meta: {
@@ -516,7 +647,7 @@ const downloadAndSend = async (
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const isYouTube = isYouTubeUrl(url)
-		const cookieArgsList = isYouTube ? [] : await cookieArgs()
+		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
 		const isMp3Format = isRawFormat && quality === "mp3"
@@ -906,7 +1037,12 @@ const downloadAndSend = async (
 		console.log(`[SUCCESS] Sent video to chat ${ctx.chat.id}`)
 	} catch (error) {
 		console.error(`[ERROR] Failed to download/send ${url}:`, error)
-		const msg = `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+		await notifyAdminError(
+			ctx.chat,
+			`URL: ${cleanUrl(url)}`,
+			error instanceof Error ? error.message : "Unknown error",
+		)
+		const msg = "Ошибка."
 		if (statusMessageId) {
 			await updateMessage(ctx, statusMessageId, msg)
 		} else if (ctx.callbackQuery) {
@@ -940,12 +1076,26 @@ bot.command("cookie", async (ctx) => {
 bot.command("clear", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
 	try {
-		queue.clear()
+		const removed = queue.clear()
+		for (const entry of removed) {
+			const meta = jobMeta.get(entry.id)
+			if (meta) {
+				unlockUserUrl(meta.userId, meta.url, meta.lockId)
+				jobMeta.delete(entry.id)
+			}
+		}
 		requestCache.clear()
 		await unlink(COOKIE_FILE)
 		await ctx.reply("Cookies deleted, queue cleared, and request cache reset.")
 	} catch (error) {
-		queue.clear()
+		const removed = queue.clear()
+		for (const entry of removed) {
+			const meta = jobMeta.get(entry.id)
+			if (meta) {
+				unlockUserUrl(meta.userId, meta.url, meta.lockId)
+				jobMeta.delete(entry.id)
+			}
+		}
 		requestCache.clear()
 		await ctx.reply("Queue and cache cleared. Cookies file was not found.")
 	}
@@ -995,7 +1145,8 @@ bot.on("message:document", async (ctx) => {
 			debugInfo += `\nFailed to list dirs: ${e instanceof Error ? e.message : "Unknown"}`
 		}
 
-		await ctx.reply(`DEBUG ERROR: ${error instanceof Error ? error.message : "Unknown"}${debugInfo}`)
+		console.error(`DEBUG ERROR: ${error instanceof Error ? error.message : "Unknown"}${debugInfo}`)
+		await ctx.reply("Ошибка.")
 	} finally {
 		await deleteMessage(processing)
 	}
@@ -1020,6 +1171,20 @@ bot.command("formats", async (ctx) => {
 	}
 })
 
+bot.command("cancel", async (ctx) => {
+	const userId = ctx.from?.id
+	if (!userId) return
+	const removedRequests = cancelUserRequests(userId)
+	const { removedCount, remainingActive } = cancelUserJobs(userId)
+	if (removedCount === 0 && remainingActive === 0 && removedRequests === 0) {
+		await ctx.reply("У вас нет активных заданий.")
+		return
+	}
+	await ctx.reply(
+		`Отменено заданий в очереди: ${removedCount}. Активных в работе: ${remainingActive}.`,
+	)
+})
+
 bot.on("message:text", async (ctx, next) => {
 	const userId = ctx.from?.id
 	if (!userId) return await next()
@@ -1033,63 +1198,76 @@ bot.on("message:text", async (ctx, next) => {
 			return
 		}
 
-						const processing = await ctx.reply("Получаем форматы...")
-						try {
-						const isYouTube = isYouTubeUrl(url)
-						const cookieArgsList = isYouTube ? [] : await cookieArgs()
-						const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-						const additionalArgs = urlMatcher(url, "tiktok.com") ? tiktokArgs : []
-						const info = await safeGetInfo(url, [
-							"--dump-json",
-							"--no-warnings",
-							"--no-playlist",
-							...cookieArgsList,
-							...additionalArgs,
-							...impersonateArgs,
-							...youtubeArgs,
-						])
-			
-						if (!info.formats || info.formats.length === 0) {
-							await ctx.reply("No formats found.")
-							return
-						}
-						const formats = info.formats || []
-			
-						const requestId = randomUUID().split("-")[0]
-						if (!requestId) {
-							throw new Error("Failed to generate request ID.")
-						}
-						const filteredFormats = formats.filter((f) => f.format_id)
-						requestCache.set(requestId, {
-							url,
-							title: info.title,
-							formats: filteredFormats,
-						})
-						// Expire cache after 1 hour
-						setTimeout(() => requestCache.delete(requestId), 3600000)
+		const lockResult = lockUserUrl(userId, url)
+		if (!lockResult.ok) {
+			await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.")
+			return
+		}
+		const lockId = lockResult.lockId
+		let keepLock = false
+		const processing = await ctx.reply("Получаем форматы...")
+		try {
+			const isYouTube = isYouTubeUrl(url)
+			const cookieArgsList = await cookieArgs()
+			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+			const additionalArgs = urlMatcher(url, "tiktok.com") ? tiktokArgs : []
+			const info = await safeGetInfo(url, [
+				"--dump-json",
+				"--no-warnings",
+				"--no-playlist",
+				...cookieArgsList,
+				...additionalArgs,
+				...impersonateArgs,
+				...youtubeArgs,
+			])
 
-						console.log(`[DEBUG] Total formats: ${formats.length}`)
-						console.log(`[DEBUG] Filtered formats count: ${filteredFormats.length}`)
-						console.log(
-							`[DEBUG] Filtered format IDs: ${filteredFormats.map((f) => f.format_id).join(", ")}`,
-						)
+			if (!info.formats || info.formats.length === 0) {
+				await ctx.reply("No formats found.")
+				return
+			}
+			const formats = info.formats || []
 
-						const { dashEntries, hlsEntries, mhtmlEntries } =
-							splitFormatEntries(filteredFormats)
-						const hasMp3 = filteredFormats.some((f) => f.format_id === "251")
+			const requestId = randomUUID().split("-")[0]
+			if (!requestId) {
+				throw new Error("Failed to generate request ID.")
+			}
+			const filteredFormats = formats.filter((f) => f.format_id)
+			requestCache.set(requestId, {
+				url,
+				title: info.title,
+				formats: filteredFormats,
+				userId,
+				lockId,
+			})
+			scheduleRequestExpiry(requestId)
+			keepLock = true
 
-						await sendFormatSelector(
-							ctx,
-							requestId,
-							info.title,
-							dashEntries.length,
-							hlsEntries.length,
-							mhtmlEntries.length,
-							hasMp3,
-						)
+			console.log(`[DEBUG] Total formats: ${formats.length}`)
+			console.log(`[DEBUG] Filtered formats count: ${filteredFormats.length}`)
+			console.log(
+				`[DEBUG] Filtered format IDs: ${filteredFormats.map((f) => f.format_id).join(", ")}`,
+			)
+
+			const { dashEntries, hlsEntries, mhtmlEntries } =
+				splitFormatEntries(filteredFormats)
+			const hasMp3 = filteredFormats.some((f) => f.format_id === "251")
+
+			await sendFormatSelector(
+				ctx,
+				requestId,
+				info.title,
+				dashEntries.length,
+				hlsEntries.length,
+				mhtmlEntries.length,
+				hasMp3,
+			)
 		} catch (error) {
-			await ctx.reply(`Error: ${error instanceof Error ? error.message : "Unknown"}`)
+			console.error("Formats error:", error)
+			await ctx.reply("Ошибка.")
 		} finally {
+			if (!keepLock) {
+				unlockUserUrl(userId, url, lockId)
+			}
 			await deleteMessage(processing)
 		}
 	} else {
@@ -1126,6 +1304,19 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const isPrivate = ctx.chat.type === "private"
 	const threadId = ctx.message.message_thread_id
 	let processingMessage: any
+	const userId = ctx.from?.id
+	if (!userId) return
+	const lockResult = lockUserUrl(userId, url.text)
+	if (!lockResult.ok) {
+		await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.", {
+			reply_to_message_id: ctx.message.message_id,
+			message_thread_id: threadId,
+		})
+		return
+	}
+	const lockId = lockResult.lockId
+	let keepLock = false
+	let lockTransferred = false
 
 	if (isPrivate) {
 		processingMessage = await ctx.replyWithHTML(t.processing, {
@@ -1225,7 +1416,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const isYouTube = isYouTubeUrl(url.text)
-		const cookieArgsList = isYouTube ? [] : await cookieArgs()
+		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
 		if (useCobalt && !isSora) {
@@ -1252,7 +1443,15 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		// If group chat OR always download best is enabled -> Auto download
 		if (!isPrivate || ALWAYS_DOWNLOAD_BEST) {
 			autoDeleteProcessingMessage = false
-			queue.add(async () => {
+			const blockReason = getQueueBlockReason(userId, url.text, lockId)
+			if (blockReason) {
+				await ctx.reply(blockReason, {
+					reply_to_message_id: ctx.message.message_id,
+					message_thread_id: threadId,
+				})
+				return
+			}
+			enqueueJob(userId, url.text, lockId, async () => {
 				await downloadAndSend(
 					ctx,
 					url.text,
@@ -1263,6 +1462,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					ctx.message.message_id,
 				)
 			})
+			lockTransferred = true
 			return
 		}
 
@@ -1270,9 +1470,14 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		if (!requestId) {
 			throw new Error("Failed to generate request ID")
 		}
-		requestCache.set(requestId, { url: url.text, title })
-		// Expire cache after 1 hour
-		setTimeout(() => requestCache.delete(requestId), 3600000)
+		requestCache.set(requestId, {
+			url: url.text,
+			title,
+			userId,
+			lockId,
+		})
+		scheduleRequestExpiry(requestId)
+		keepLock = true
 
 		const formats = info.formats || []
 		const availableHeights = new Set(
@@ -1321,6 +1526,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			try {
 				await deleteMessage(processingMessage)
 			} catch {}
+		}
+		if (!keepLock && !lockTransferred) {
+			unlockUserUrl(userId, url.text, lockId)
 		}
 	}
 })
@@ -1382,8 +1590,20 @@ bot.on("callback_query:data", async (ctx) => {
 				})
 				return
 			}
+			const userId = ctx.from?.id
+			if (!userId) return
+			const blockReason = getQueueBlockReason(userId, cached.url, cached.lockId)
+			if (blockReason) {
+				await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
+				return
+			}
+			if (!cached.lockId) {
+				await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
+				return
+			}
+			requestCache.delete(requestId)
 			const processing = await ctx.reply("Ставим в очередь MP3...")
-			queue.add(async () => {
+			enqueueJob(userId, cached.url, cached.lockId, async () => {
 				await downloadAndSend(
 					ctx,
 					cached.url,
@@ -1490,10 +1710,22 @@ bot.on("callback_query:data", async (ctx) => {
 			return await ctx.deleteMessage()
 		}
 		const formatString = `${videoId}+${audioId}`
+		const userId = ctx.from?.id
+		if (!userId) return
+		const blockReason = getQueueBlockReason(userId, cached.url, cached.lockId)
+		if (blockReason) {
+			await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
+			return
+		}
+		if (!cached.lockId) {
+			await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
+			return
+		}
+		requestCache.delete(requestId)
 		const processing = await ctx.reply(
 			`Ставим в очередь формат: ${formatString}...`,
 		)
-		queue.add(async () => {
+		enqueueJob(userId, cached.url, cached.lockId, async () => {
 			await downloadAndSend(
 				ctx,
 				cached.url,
@@ -1529,18 +1761,32 @@ bot.on("callback_query:data", async (ctx) => {
 
 	if (quality === "cancel") {
 		requestCache.delete(requestId)
+		if (cached.lockId && cached.userId) {
+			unlockUserUrl(cached.userId, cached.url, cached.lockId)
+		}
 		await ctx.answerCallbackQuery({ text: "Cancelled" })
 		return await ctx.deleteMessage()
 	}
 
+	const predefinedQualities = ["b", "2160", "1440", "1080", "720", "480", "audio"]
+	const isRawFormat = !predefinedQualities.includes(quality)
+	const userId = ctx.from?.id
+	if (!userId) return
+	const blockReason = getQueueBlockReason(userId, url, cached.lockId)
+	if (blockReason) {
+		await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
+		return
+	}
 	await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
 	await ctx.editMessageText(
 		`Скачиваем ${quality === "b" ? "Лучшее" : quality}...`,
 	)
-
-	const predefinedQualities = ["b", "2160", "1440", "1080", "720", "480", "audio"]
-	const isRawFormat = !predefinedQualities.includes(quality)
-	queue.add(async () => {
+	if (!cached.lockId) {
+		await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
+		return
+	}
+	requestCache.delete(requestId)
+	enqueueJob(userId, url, cached.lockId, async () => {
 		await downloadAndSend(
 			ctx,
 			url,

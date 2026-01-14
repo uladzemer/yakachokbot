@@ -1,7 +1,8 @@
 type GenericFunction = (...parameters: unknown[]) => Promise<unknown>
+type QueueEntry = { id: string; executor: GenericFunction }
 
 export class Queue {
-	private queue: GenericFunction[] = []
+	private queue: QueueEntry[] = []
 	private active = 0
 	private concurrency: number
 
@@ -9,10 +10,10 @@ export class Queue {
 		this.concurrency = concurrency
 	}
 
-	private run = async (executor: GenericFunction) => {
+	private run = async (entry: QueueEntry) => {
 		this.active++
 		try {
-			await executor()
+			await entry.executor()
 		} catch (error) {
 			console.log(error)
 		} finally {
@@ -30,12 +31,31 @@ export class Queue {
 		}
 	}
 
-	add = <F extends GenericFunction>(executor: F) => {
-		this.queue.push(executor)
+	add = <F extends GenericFunction>(executor: F, id: string) => {
+		this.queue.push({ id, executor })
 		this.next()
+		return id
+	}
+
+	remove = (predicate: (entry: QueueEntry) => boolean) => {
+		const removed: QueueEntry[] = []
+		this.queue = this.queue.filter((entry) => {
+			if (predicate(entry)) {
+				removed.push(entry)
+				return false
+			}
+			return true
+		})
+		return removed
 	}
 
 	clear = () => {
+		const removed = this.queue
 		this.queue = []
+		return removed
 	}
+
+	getPendingCount = () => this.queue.length
+	getActiveCount = () => this.active
+}
 }
