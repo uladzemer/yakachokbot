@@ -7,6 +7,8 @@ services:
     volumes:
       - ./yakachokbot:/app/storage
       - telegram-bot-server-data:/var/lib/telegram-bot-api
+    tmpfs:
+      - /tmp
     env_file:
       - .env
     environment:
@@ -39,6 +41,18 @@ services:
         condition: service_healthy
       cobalt:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f \"tsx -r dotenv/config src/index.ts\" >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+    mem_limit: 2g
+    cpus: "1.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
@@ -59,6 +73,13 @@ services:
       interval: 5s
       timeout: 30s
       retries: 3
+    mem_limit: 1g
+    cpus: "1.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   cobalt:
     image: ghcr.io/imputnet/cobalt:latest
@@ -70,6 +91,13 @@ services:
       interval: 5s
       timeout: 30s
       retries: 3
+    mem_limit: 1g
+    cpus: "1.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   watchtower:
     image: containrrr/watchtower
@@ -79,6 +107,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: --interval 3600 --cleanup
+    mem_limit: 512m
+    cpus: "0.5"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   telegram-bot-server-data:
