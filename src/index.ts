@@ -958,7 +958,7 @@ const downloadAndSend = async (
 ) => {
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
-	const tempDir = resolve("/tmp", `telegram-ytdl-${tempBaseId}`)
+	const tempDir = resolve("/tmp", `yakachokbot-${tempBaseId}`)
 	await mkdir(tempDir, { recursive: true })
 	let tempFilePath = resolve(tempDir, "video.mp4")
 	const tempThumbPath = resolve(tempDir, "thumb.jpg")

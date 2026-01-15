@@ -1,9 +1,9 @@
-# telegram-ytdl
+# Yakachokbot
 
 #### A simple & fast YouTube download Telegram bot.
 
-[![Telegram Bot](https://img.shields.io/badge/TELEGRAM-BOT-%2330A3E6?style=for-the-badge&logo=telegram)](https://t.me/vYTDL_bot)
-![GitHub top language](https://img.shields.io/github/languages/top/vaaski/telegram-ytdl?style=for-the-badge)
+[![Telegram Bot](https://img.shields.io/badge/TELEGRAM-BOT-%2330A3E6?style=for-the-badge&logo=telegram)](https://t.me/yakachokbot)
+![GitHub top language](https://img.shields.io/github/languages/top/uladzemer/yakachokbot?style=for-the-badge)
 
 ## Synopsis
 
@@ -53,8 +53,8 @@ I recommend [Hetzner][hetzner] and you can get 20€ in credits for free using m
   | `OPENAI_API_KEY`        | Your OpenAI API key (optional, used for auto-translation)                                                                                      |
 
 - Run `docker compose up -d` in the folder you created.
-- You can put a cookies.txt file into the `./vaaski-telegram-ytdl` directory to be picked up automatically by the bot.
-- The `./vaaski-telegram-ytdl` directory will also house a `saved-translations.json` file if you've set up auto-translation.
+- You can put a cookies.txt file into the `./yakachokbot` directory to be picked up automatically by the bot.
+- The `./yakachokbot` directory will also house a `saved-translations.json` file if you've set up auto-translation.
 
 If you have any problems with hosting feel free to contact me or open an issue.
 

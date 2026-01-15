@@ -1,11 +1,11 @@
-name: telegram-ytdl
+name: yakachokbot
 
 services:
   telegram-bot:
     build: .
     restart: unless-stopped
     volumes:
-      - ./vaaski-telegram-ytdl:/app/storage
+      - ./yakachokbot:/app/storage
       - telegram-bot-server-data:/var/lib/telegram-bot-api
     env_file:
       - .env
