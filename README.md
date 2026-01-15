@@ -1,65 +1,51 @@
 # Yakachokbot
 
-#### A simple & fast YouTube download Telegram bot.
+Телеграм-бот для быстрой загрузки видео и аудио с разных сайтов через yt-dlp.
 
 [![Telegram Bot](https://img.shields.io/badge/TELEGRAM-BOT-%2330A3E6?style=for-the-badge&logo=telegram)](https://t.me/yakachokbot)
 ![GitHub top language](https://img.shields.io/github/languages/top/uladzemer/yakachokbot?style=for-the-badge)
 
-## Synopsis
+## Возможности
 
-I was never satisfied with any YouTube downloader solution, because they either required chasing some website that was
-either bloated with ads, painfully slow, taken down the next day or all of those combined.
-Using [yt-dlp][yt-dlp] in the command line was my go-to,
-but doesn't really work great on mobile.
+- Скачивание видео и аудио по ссылке
+- Выбор качества в личных чатах
+- Поддержка большинства сайтов, которые умеет yt-dlp
+- Поддержка cookies.txt для сложных сайтов
+- Загрузка файлов до 2 ГБ через локальный Telegram Bot API
 
-**So I made this bot, to download from a single place across platforms, fast and effortless.**
+## Установка (Docker)
 
-The bot then simply passes the URL to [yt-dlp][yt-dlp] with the `-f b` flag, which downloads the best quality
-format that contains both video and audio. This is meant to work together with a self-hosted
-Telegram bot API server, so that the upload limit for bots is increased from 50MB to 2GB.
+1) Установите Docker: https://docs.docker.com/engine/install
+2) Скопируйте `compose.yml` в пустую папку.
+3) Создайте `.env` на основе `.env.example` и заполните значения.
+4) Запустите:
 
-Because content sites change often (especially TikTok!), the bot uses the nightly build of yt-dlp to
-always get the latest resolvers. It will also auto-update yt-dlp every night as long as you don't
-set `YTDL_AUTOUPDATE` to `"false"`.
+```bash
+docker compose up -d
+```
 
-The instance hosted by me is no longer available for public use, but you can simply host your own instance.
+## Переменные окружения
 
-## Hosting
+| Переменная              | Описание                                                                                                                   |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`    | Токен бота (получить у [BotFather][botfather])                                                                             |
+| `WHITELISTED_IDS`       | Список Telegram ID пользователей через запятую, пусто = доступ всем ([getidsbot][id-bot])                                  |
+| `ADMIN_ID`              | Ваш Telegram ID ([getidsbot][id-bot])                                                                                      |
+| `ALLOW_GROUPS`          | Разрешить группы (`"true"` или `"false"`, по умолчанию `"false"`)                                                          |
+| `TELEGRAM_API_ID`       | API ID Telegram ([инструкция][telegram-api-id])                                                                            |
+| `TELEGRAM_API_HASH`     | API HASH Telegram ([инструкция][telegram-api-id])                                                                          |
+| `TELEGRAM_API_ROOT`     | URL локального Telegram Bot API                                                                                            |
+| `TELEGRAM_WEBHOOK_PORT` | Порт вебхука (если используете вебхук)                                                                                     |
+| `TELEGRAM_WEBHOOK_URL`  | URL вебхука (если используете вебхук)                                                                                      |
+| `YTDL_AUTOUPDATE`       | Автообновление yt-dlp (`"true"` или `"false"`, по умолчанию `"true"`)                                                      |
+| `OPENAI_API_KEY`        | Ключ OpenAI (опционально, авто‑переводы)                                                                                   |
 
-To host your own instance of this bot, you need to have a Telegram bot token, Telegram API Token
-and a server to run the bot on. You can create a Telegram bot with [BotFather][botfather] and purchase
-a cheap VPS with the hoster of your choice.
+## Файлы и хранилище
 
-I recommend [Hetzner][hetzner] and you can get 20€ in credits for free using my [referral link][hetzner].
-
-### Installation
-
-- [Install Docker](https://docs.docker.com/engine/install)
-- Create a folder and put the [compose.yml](./compose.yml) into it.
-- Fill out and adjust the following variables in the docker-compose.yml file:
-
-  | Variable                | Description                                                                                                                                    |
-  | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-  | `TELEGRAM_BOT_TOKEN`    | Your Telegram bot token (get it from [BotFather][botfather])                                                                                   |
-  | `WHITELISTED_IDS`       | A comma-separated list of Telegram user IDs that are allowed to use the bot (get them from [this bot][id-bot]), leave empty to allow all users |
-  | `ADMIN_ID`              | Your Telegram user ID (get it from [this bot][id-bot])                                                                                         |
-  | `ALLOW_GROUPS`          | Whether to allow groups (defaults to `"false"`, set to `"true"` to enable)                                                                     |
-  | `TELEGRAM_API_ID`       | Your Telegram API ID (get it [here][telegram-api-id])                                                                                          |
-  | `TELEGRAM_API_HASH`     | Your Telegram API hash (get it [here][telegram-api-id])                                                                                        |
-  | `TELEGRAM_API_ROOT`     | The URL of your Telegram bot API server (can probably be left unchanged)                                                                       |
-  | `TELEGRAM_WEBHOOK_PORT` | The port the bot will listen on (can probably be left unchanged)                                                                               |
-  | `TELEGRAM_WEBHOOK_URL`  | The URL of your Telegram bot API server (can probably be left unchanged)                                                                       |
-  | `YTDL_AUTOUPDATE`       | Whether to automatically update yt-dlp (defaults to `"true"`, set to `"false"` to disable)                                                     |
-  | `OPENAI_API_KEY`        | Your OpenAI API key (optional, used for auto-translation)                                                                                      |
-
-- Run `docker compose up -d` in the folder you created.
-- You can put a cookies.txt file into the `./yakachokbot` directory to be picked up automatically by the bot.
-- The `./yakachokbot` directory will also house a `saved-translations.json` file if you've set up auto-translation.
-
-If you have any problems with hosting feel free to contact me or open an issue.
+- Куки складывайте в `./yakachokbot/cookies.txt`.
+- В `./yakachokbot` также хранится `saved-translations.json`, если включены авто‑переводы.
 
 [yt-dlp]: https://github.com/yt-dlp/yt-dlp
 [telegram-api-id]: https://core.telegram.org/api/obtaining_api_id
 [id-bot]: https://t.me/getidsbot
 [botfather]: https://t.me/BotFather
-[hetzner]: https://hetzner.cloud/?ref=e5ntAQJVvxX1
