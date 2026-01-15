@@ -78,6 +78,43 @@ const updateMessage = (() => {
 	}
 })()
 
+const lastBotMenuMessages = new Map<string, number>()
+
+const getChatKey = (ctx: any) => {
+	const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id
+	if (!chatId) return undefined
+	const threadId =
+		ctx.message?.message_thread_id ||
+		ctx.callbackQuery?.message?.message_thread_id
+	return `${chatId}:${threadId ?? "main"}`
+}
+
+const deletePreviousMenuMessage = async (ctx: any) => {
+	const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id
+	if (!chatId) return
+	const key = getChatKey(ctx)
+	if (!key) return
+	const previousId = lastBotMenuMessages.get(key)
+	if (!previousId) return
+	try {
+		await ctx.api.deleteMessage(chatId, previousId)
+	} catch {}
+	lastBotMenuMessages.delete(key)
+}
+
+const trackMenuMessage = (ctx: any, message: any) => {
+	const key = getChatKey(ctx)
+	if (!key || !message?.message_id) return
+	lastBotMenuMessages.set(key, message.message_id)
+}
+
+const deleteUserMessage = async (ctx: any) => {
+	if (!ctx.message?.message_id) return
+	try {
+		await ctx.deleteMessage()
+	} catch {}
+}
+
 const spawnPromise = (
 	command: string,
 	args: string[],
@@ -104,8 +141,16 @@ const spawnPromise = (
 	})
 }
 
-const safeGetInfo = async (url: string, args: string[], signal?: AbortSignal) => {
-	const runtimeArgs = args.includes("--js-runtimes") ? args : [...jsRuntimeArgs, ...args]
+const safeGetInfo = async (
+	url: string,
+	args: string[],
+	signal?: AbortSignal,
+	skipJsRuntime = false,
+) => {
+	const runtimeArgs =
+		skipJsRuntime || args.includes("--js-runtimes")
+			? args
+			: [...jsRuntimeArgs, ...args]
 	const runtimeArgsWithCache = runtimeArgs.includes("--no-cache-dir")
 		? runtimeArgs
 		: [...runtimeArgs, "--no-cache-dir"]
@@ -562,6 +607,7 @@ const sendFormatSelector = async (
 	mhtmlCount: number,
 	hasMp3: boolean,
 ) => {
+	await deletePreviousMenuMessage(ctx)
 	const keyboard = new InlineKeyboard()
 	keyboard.text(`DASH (${dashCount})`, `f:${requestId}:dash`)
 	keyboard.text(`HLS (${hlsCount})`, `f:${requestId}:hls`).row()
@@ -573,10 +619,11 @@ const sendFormatSelector = async (
 	}
 
 	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
-	await ctx.reply(`Выберите список форматов для: ${title}`, {
+	const menuMessage = await ctx.reply(`Выберите список форматов для: ${title}`, {
 		reply_markup: keyboard,
 		message_thread_id: threadId,
 	})
+	trackMenuMessage(ctx, menuMessage)
 }
 
 const sendFormatSection = async (
@@ -605,10 +652,12 @@ const sendFormatSection = async (
 		if (allowCombine) {
 			keyboard.text("Объединить форматы", `c:${requestId}`).row()
 		}
-		await ctx.reply(`Actions for: ${title}`, {
+		await deletePreviousMenuMessage(ctx)
+		const menuMessage = await ctx.reply(`Actions for: ${title}`, {
 			reply_markup: keyboard,
 			message_thread_id: threadId,
 		})
+		trackMenuMessage(ctx, menuMessage)
 		return
 	}
 
@@ -622,10 +671,12 @@ const sendFormatSection = async (
 		keyboard.text("Объединить форматы", `c:${requestId}`).row()
 	}
 	keyboard.text("Назад", `f:${requestId}:back`).row()
-	await ctx.reply(`Select ${label} format for: ${title}`, {
+	await deletePreviousMenuMessage(ctx)
+	const menuMessage = await ctx.reply(`Select ${label} format for: ${title}`, {
 		reply_markup: keyboard,
 		message_thread_id: threadId,
 	})
+	trackMenuMessage(ctx, menuMessage)
 }
 
 const sendCombineVideoSection = async (
@@ -648,10 +699,12 @@ const sendCombineVideoSection = async (
 		})
 		const keyboard = new InlineKeyboard()
 		keyboard.text("Назад", `f:${requestId}:dash`).row()
-		await ctx.reply("Actions for combine:", {
+		await deletePreviousMenuMessage(ctx)
+		const menuMessage = await ctx.reply("Actions for combine:", {
 			reply_markup: keyboard,
 			message_thread_id: threadId,
 		})
+		trackMenuMessage(ctx, menuMessage)
 		return
 	}
 
@@ -662,10 +715,12 @@ const sendCombineVideoSection = async (
 			.row()
 	}
 	keyboard.text("Назад", `f:${requestId}:dash`).row()
-	await ctx.reply(`Select video format to combine for: ${title}`, {
+	await deletePreviousMenuMessage(ctx)
+	const menuMessage = await ctx.reply(`Select video format to combine for: ${title}`, {
 		reply_markup: keyboard,
 		message_thread_id: threadId,
 	})
+	trackMenuMessage(ctx, menuMessage)
 }
 
 const sendCombineAudioSection = async (
@@ -689,10 +744,12 @@ const sendCombineAudioSection = async (
 		})
 		const keyboard = new InlineKeyboard()
 		keyboard.text("Назад", `c:${requestId}`).row()
-		await ctx.reply("Actions for combine:", {
+		await deletePreviousMenuMessage(ctx)
+		const menuMessage = await ctx.reply("Actions for combine:", {
 			reply_markup: keyboard,
 			message_thread_id: threadId,
 		})
+		trackMenuMessage(ctx, menuMessage)
 		return
 	}
 
@@ -706,10 +763,12 @@ const sendCombineAudioSection = async (
 			.row()
 	}
 	keyboard.text("Назад", `c:${requestId}`).row()
-	await ctx.reply(`Select audio format to combine for: ${title}`, {
+	await deletePreviousMenuMessage(ctx)
+	const menuMessage = await ctx.reply(`Select audio format to combine for: ${title}`, {
 		reply_markup: keyboard,
 		message_thread_id: threadId,
 	})
+	trackMenuMessage(ctx, menuMessage)
 }
 
 const isAbortError = (error: unknown) =>
@@ -726,6 +785,7 @@ const downloadAndSend = async (
 	signal?: AbortSignal,
 	forceAudio = false,
 	formatLabelTail?: string,
+	forceHls = false,
 ) => {
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
@@ -796,6 +856,7 @@ const downloadAndSend = async (
 			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
 		}
 
+		const skipJsRuntimeForInfo = isYouTube
 		const info = await safeGetInfo(
 			url,
 			[
@@ -809,6 +870,7 @@ const downloadAndSend = async (
 				...youtubeArgs,
 			],
 			signal,
+			skipJsRuntimeForInfo,
 		)
 
 		const title = overrideTitle || removeHashtagsMentions(info.title)
@@ -873,6 +935,23 @@ const downloadAndSend = async (
 			formatProtocol.includes("mhtml") ||
 			formatNote.includes("storyboard") ||
 			formatLine.includes("storyboard")
+		const hlsPreferredByFormatArgs = formatArgs.some((arg) =>
+			arg.includes("protocol*=m3u8"),
+		)
+		const isHlsDownload =
+			forceHls ||
+			(!isMhtml &&
+				(hlsPreferredByFormatArgs ||
+					formatProtocol.includes("m3u8") ||
+					formatProtocol.includes("hls") ||
+					requestedFormats.some((format: any) => {
+						const protocol = `${format?.protocol || ""}`.toLowerCase()
+						return protocol.includes("m3u8") || protocol.includes("hls")
+					})))
+		const hlsPoTokenArgs =
+			isYouTube && isHlsDownload
+				? ["--extractor-args", "youtube:fetch_pot=always"]
+				: []
 
 		if (!isAudioRequest) {
 			const vcodec = info.vcodec || ""
@@ -941,9 +1020,8 @@ const downloadAndSend = async (
 		if (fallbackFormatArgs && !fallbackFormatArgs.includes("--no-cache-dir")) {
 			fallbackFormatArgs.push("--no-cache-dir")
 		}
-		const usesHlsPreferred = formatArgs.some((arg) =>
-			arg.includes("protocol*=m3u8"),
-		)
+		const usesHlsPreferred =
+			formatArgs.some((arg) => arg.includes("protocol*=m3u8")) || isHlsDownload
 		if (usesHlsPreferred) {
 			formatArgs.push(
 				"--downloader",
@@ -1022,9 +1100,11 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		} else {
-			const downloadArgs = formatArgs.includes("--js-runtimes")
-				? formatArgs
-				: [...jsRuntimeArgs, ...formatArgs]
+			const skipJsRuntime = isYouTube && isHlsDownload
+			const downloadArgs =
+				formatArgs.includes("--js-runtimes") || skipJsRuntime
+					? formatArgs
+					: [...jsRuntimeArgs, ...formatArgs]
 			let progressText = "Скачиваем..."
 			let fileSize = estimatedSizeLabel
 			let downloadedSize = ""
@@ -1151,30 +1231,80 @@ const downloadAndSend = async (
 				}, 15000)
 			}
 
-			try {
+			const runDownload = async (
+				args: string[],
+				extraArgs: string[],
+				cookieArgsOverride: string[] = cookieArgsList,
+			) => {
 				await spawnPromise(
 					"yt-dlp",
 					[
 						url,
-						...downloadArgs,
+						...args,
 						"-o",
 						tempFilePath,
 						"--no-part",
 						"--no-warnings",
 						"--no-playlist",
-						...cookieArgsList,
+						...cookieArgsOverride,
 						...additionalArgs,
-						...impersonateArgs,
-						...youtubeArgs,
+						...extraArgs,
 					],
 					onProgress,
 					signal,
 				)
-			} catch (error) {
-				if (!fallbackFormatArgs) throw error
-				const retryArgs = fallbackFormatArgs.includes("--js-runtimes")
-					? fallbackFormatArgs
-					: [...jsRuntimeArgs, ...fallbackFormatArgs]
+			}
+
+			let downloadSucceeded = false
+			let lastDownloadError: unknown = null
+			if (isYouTube && isHlsDownload) {
+				const hlsAttempts = [
+					{
+						label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем без cookies...`,
+						extraArgs: [...hlsPoTokenArgs],
+						cookies: [] as string[],
+					},
+					{
+						label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем с cookies...`,
+						extraArgs: [...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
+						cookies: cookieArgsList,
+					},
+				]
+				for (const attempt of hlsAttempts) {
+					if (statusMessageId) {
+						await updateMessage(ctx, statusMessageId, attempt.label)
+					}
+					try {
+						await runDownload(downloadArgs, attempt.extraArgs, attempt.cookies)
+						downloadSucceeded = true
+						break
+					} catch (error) {
+						lastDownloadError = error
+					}
+				}
+			} else {
+				try {
+					await runDownload(
+						downloadArgs,
+						[...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
+						cookieArgsList,
+					)
+					downloadSucceeded = true
+				} catch (error) {
+					lastDownloadError = error
+				}
+			}
+
+			if (!downloadSucceeded) {
+				if (!fallbackFormatArgs) {
+					throw lastDownloadError instanceof Error
+						? lastDownloadError
+						: new Error("Download failed")
+				}
+				const retryArgs =
+					fallbackFormatArgs.includes("--js-runtimes") || skipJsRuntime
+						? fallbackFormatArgs
+						: [...jsRuntimeArgs, ...fallbackFormatArgs]
 				if (statusMessageId) {
 					await updateMessage(
 						ctx,
@@ -1182,27 +1312,14 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: HLS недоступен, пробуем другое...`,
 					)
 				}
-				await spawnPromise(
-					"yt-dlp",
-					[
-						url,
-						...retryArgs,
-						"-o",
-						tempFilePath,
-						"--no-part",
-						"--no-warnings",
-						"--no-playlist",
-						...cookieArgsList,
-						...additionalArgs,
-						...impersonateArgs,
-						...youtubeArgs,
-					],
-					onProgress,
-					signal,
+				await runDownload(
+					retryArgs,
+					[...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
+					cookieArgsList,
 				)
-			} finally {
-				if (statusHeartbeat) clearInterval(statusHeartbeat)
+				downloadSucceeded = true
 			}
+			if (statusHeartbeat) clearInterval(statusHeartbeat)
 
 			const hasVideoTrack = info.vcodec && info.vcodec !== "none"
 			const needsAudioFix =
@@ -1407,11 +1524,13 @@ bot.use(async (ctx, next) => {
 
 bot.command("cookie", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
 	await ctx.reply("To update cookies, simply send the 'cookies.txt' file as a document in this chat.")
 })
 
 bot.command("clear", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
 	try {
 		const removed = queue.clear()
 		for (const entry of removed) {
@@ -1510,15 +1629,26 @@ bot.on("message:text", async (ctx, next) => {
 })
 
 const userState = new Map<number, string>()
+const userPromptMessages = new Map<number, { chatId: number; messageId: number }>()
 
 bot.command("formats", async (ctx) => {
-	if (ctx.from?.id) {
-		userState.set(ctx.from.id, "waiting_for_formats_url")
-		await ctx.reply("Пришлите ссылку.")
+	await deleteUserMessage(ctx)
+	const userId = ctx.from?.id
+	if (!userId) return
+	const previousPrompt = userPromptMessages.get(userId)
+	if (previousPrompt) {
+		try {
+			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
+		} catch {}
+		userPromptMessages.delete(userId)
 	}
+	userState.set(userId, "waiting_for_formats_url")
+	const prompt = await ctx.reply("Пришлите ссылку.")
+	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
 })
 
 bot.command("cancel", async (ctx) => {
+	await deleteUserMessage(ctx)
 	const userId = ctx.from?.id
 	if (!userId) return
 	const removedRequests = cancelUserRequests(userId)
@@ -1544,6 +1674,15 @@ bot.on("message:text", async (ctx, next) => {
 	const state = userState.get(userId)
 	if (state === "waiting_for_formats_url") {
 		userState.delete(userId)
+		const promptMessage = userPromptMessages.get(userId)
+		if (promptMessage) {
+			try {
+				await ctx.api.deleteMessage(promptMessage.chatId, promptMessage.messageId)
+			} catch {}
+			userPromptMessages.delete(userId)
+		}
+		await deletePreviousMenuMessage(ctx)
+		await deleteUserMessage(ctx)
 		const url = ctx.message.text
 		if (!url) {
 			await ctx.reply("Invalid URL.")
@@ -1664,11 +1803,13 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			reply_to_message_id: ctx.message.message_id,
 			message_thread_id: threadId,
 		})
+		await deleteUserMessage(ctx)
 		return
 	}
 	const lockId = lockResult.lockId
 	let keepLock = false
 	let lockTransferred = false
+	let deleteIncomingMessage = true
 
 	if (isPrivate) {
 		processingMessage = await ctx.replyWithHTML(t.processing, {
@@ -1739,6 +1880,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 	// Move queue logic to callback, here only prepare options
 	try {
+		await deletePreviousMenuMessage(ctx)
 		let bypassTitle: string | undefined
 
 		const isSora = soraMatcher(url.text)
@@ -1854,11 +1996,13 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		keyboard.text("Audio (MP3)", `d:${requestId}:audio`).row()
 		keyboard.text("Cancel", `d:${requestId}:cancel`)
 
-		await ctx.reply(`Select quality for: ${title}`, {
+		await deletePreviousMenuMessage(ctx)
+		const menuMessage = await ctx.reply(`Select quality for: ${title}`, {
 			reply_markup: keyboard,
 			reply_to_message_id: ctx.message.message_id,
 			message_thread_id: threadId,
 		})
+		trackMenuMessage(ctx, menuMessage)
 	} catch (error) {
 		if (await useCobaltResolver()) {
 			return
@@ -1875,6 +2019,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			console.error(`Group silent fail for ${url.text}:`, error)
 		}
 	} finally {
+		if (deleteIncomingMessage) {
+			await deleteUserMessage(ctx)
+		}
 		if (autoDeleteProcessingMessage && processingMessage) {
 			try {
 				await deleteMessage(processingMessage)
@@ -1955,6 +2102,7 @@ bot.on("callback_query:data", async (ctx) => {
 				return
 			}
 			requestCache.delete(requestId)
+			await deletePreviousMenuMessage(ctx)
 			const processing = await ctx.reply("Ставим в очередь MP3...")
 			enqueueJob(userId, cached.url, cached.lockId, async (signal) => {
 				await downloadAndSend(
@@ -2076,6 +2224,7 @@ bot.on("callback_query:data", async (ctx) => {
 			return
 		}
 		requestCache.delete(requestId)
+		await deletePreviousMenuMessage(ctx)
 		const processing = await ctx.reply(
 			`Ставим в очередь формат: ${formatString}...`,
 		)
@@ -2133,6 +2282,7 @@ bot.on("callback_query:data", async (ctx) => {
 		isRawFormat && selectedMeta?.isDash && !selectedMeta.isMhtml
 			? buildFormatFilenameLabel(selectedFormat)
 			: undefined
+	const forceHls = !!selectedMeta?.isHls
 	const forceAudio =
 		!!selectedFormat &&
 		selectedFormat.vcodec === "none" &&
@@ -2166,6 +2316,7 @@ bot.on("callback_query:data", async (ctx) => {
 			signal,
 			forceAudio,
 			dashFormatLabel,
+			forceHls,
 		)
 	})
 })
