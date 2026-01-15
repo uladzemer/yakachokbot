@@ -25,7 +25,7 @@ const cobaltRegexes = [
 	/^(?:https:\/\/)?(?:www\.)?tiktok\.com\/@\w+\/photo\/\d+.*/,
 
 	// threads
-	/^(?:https:\/\/)?(?:www\.)?threads\.net\/@\w+\/post\/.+/,
+	/^(?:https:\/\/)?(?:www\.)?threads\.(?:net|com)\/@\w+\/post\/.+/,
 
 	// instagram posts
 	/^(?:https:\/\/)?(?:www\.)?instagram\.com\/p\/.+$/,

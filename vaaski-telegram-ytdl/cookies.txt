@@ -35,3 +35,4 @@ api16-normal-c-useast1a.tiktokv.com	FALSE	/	FALSE	0	odin_tt	02c452939aafcb099146
 .instagram.com	TRUE	/	TRUE	1803035643	mid	aWjL-wALAAHpj9_jPrJl7gg-wTj6
 .instagram.com	TRUE	/	TRUE	1800011643	ig_did	F07CD5B1-CC29-4E80-B28B-976B68F6AE3D
 .instagram.com	TRUE	/	TRUE	1800011643	ig_nrcb	1
+.threads.com	TRUE	/	TRUE	1803036282	csrftoken	RLbENwOz2JAg_36TQXeTyx

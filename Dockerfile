@@ -4,7 +4,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y python3 python3-pip python3-full ffmpeg curl build-essential python3-dev chromium && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp and dependencies
-RUN pip install -U "yt-dlp[impersonate]" --break-system-packages
+RUN pip install -U "yt-dlp[impersonate]" "curl_cffi" --break-system-packages
 
 WORKDIR /app
 

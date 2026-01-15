@@ -56,6 +56,7 @@ export const cleanUrl = (url: string) => {
 					"web_id",
 					"is_from_webapp",
 					"is_copy_url",
+					"xmt",
 				].includes(key)
 			) {
 				keysToDelete.push(key)

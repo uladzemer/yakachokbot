@@ -253,6 +253,82 @@ const resolveXfree = async (url: string) => {
 	}
 }
 
+const threadsMatcher = (url: string) =>
+	url.includes("threads.com") || url.includes("threads.net")
+
+const getThreadsUsername = (url: string) => {
+	const match = url.match(/threads\.(?:net|com)\/@([^/?#]+)/i)
+	if (!match) return ""
+	const username = match[1].trim()
+	if (!username) return ""
+	return username.startsWith("@") ? username : `@${username}`
+}
+
+const resolveThreads = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/threads_bypass.py",
+			url,
+		])
+		return JSON.parse(stdout)
+	} catch (e) {
+		console.error("Threads resolve error", e)
+		return { error: "Failed to run bypass script" }
+	}
+}
+
+const sendPhotoUrls = async (
+	ctx: any,
+	photoUrls: string[],
+	caption: string,
+	threadId?: number,
+	replyToMessageId?: number,
+) => {
+	if (photoUrls.length === 0) return
+	if (photoUrls.length === 1) {
+		await ctx.replyWithPhoto(photoUrls[0], {
+			caption,
+			parse_mode: "HTML",
+			reply_to_message_id: replyToMessageId,
+			message_thread_id: threadId,
+		})
+		return
+	}
+	const groups = chunkArray(10, photoUrls)
+	let isFirst = true
+	for (const group of groups) {
+		const media = group.map((url, index) => ({
+			type: "photo" as const,
+			media: url,
+			caption: isFirst && index === 0 ? caption : undefined,
+			parse_mode: isFirst && index === 0 ? "HTML" : undefined,
+		}))
+		try {
+			await ctx.api.sendMediaGroup(ctx.chat.id, media, {
+				reply_to_message_id: replyToMessageId,
+				message_thread_id: threadId,
+			})
+			isFirst = false
+		} catch (error) {
+			console.error("Failed to send media group, fallback to single photos", error)
+			for (const [index, url] of group.entries()) {
+				const withCaption = isFirst && index === 0
+				try {
+					await ctx.replyWithPhoto(url, {
+						caption: withCaption ? caption : undefined,
+						parse_mode: withCaption ? "HTML" : undefined,
+						reply_to_message_id: replyToMessageId,
+						message_thread_id: threadId,
+					})
+				} catch (photoError) {
+					console.error("Failed to send Threads photo", photoError)
+				}
+				if (withCaption) isFirst = false
+			}
+		}
+	}
+}
+
 const queue = new Queue(10)
 const MAX_GLOBAL_TASKS = 10
 const MAX_USER_URLS = 3
@@ -386,7 +462,9 @@ const cancelUserRequests = (userId: number) => {
 	for (const [requestId, cached] of requestCache.entries()) {
 		if (cached.userId === userId) {
 			requestCache.delete(requestId)
-			if (cached.lockId) unlockUserUrl(userId, cached.url, cached.lockId)
+			if (cached.lockId) {
+				unlockUserUrl(userId, getCacheLockUrl(cached), cached.lockId)
+			}
 			removed++
 		}
 	}
@@ -399,13 +477,14 @@ const scheduleRequestExpiry = (requestId: string) => {
 		if (!cached) return
 		requestCache.delete(requestId)
 		if (cached.userId && cached.lockId) {
-			unlockUserUrl(cached.userId, cached.url, cached.lockId)
+			unlockUserUrl(cached.userId, getCacheLockUrl(cached), cached.lockId)
 		}
 	}, 3600000)
 }
 const updater = new Updater()
 type RequestCacheEntry = {
 	url: string
+	sourceUrl?: string
 	title?: string
 	formats?: any[]
 	userId?: number
@@ -427,6 +506,9 @@ type FormatEntry = {
 }
 
 const requestCache = new Map<string, RequestCacheEntry>()
+
+const getCacheLockUrl = (cached: RequestCacheEntry) =>
+	cached.sourceUrl || cached.url
 
 const getFormatMeta = (format: any): FormatEntry["meta"] => {
 	const formatText = `${format.format_note || ""}`.toLowerCase()
@@ -802,6 +884,7 @@ const downloadAndSend = async (
 	forceAudio = false,
 	formatLabelTail?: string,
 	forceHls = false,
+	sourceUrl?: string,
 ) => {
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
@@ -891,7 +974,8 @@ const downloadAndSend = async (
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 		const title = overrideTitle || resolvedTitle
-		const caption = link(title || "Video", cleanUrl(url))
+		const captionUrl = sourceUrl || url
+		const caption = link(title || "Video", cleanUrl(captionUrl))
 		const safeTitle = sanitizeFilePart(title || "video", "video")
 		const formatTail = formatLabelTail
 			? sanitizeFilePart(formatLabelTail, "")
@@ -1705,8 +1789,9 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Invalid URL.")
 			return
 		}
+		const sourceUrl = url
 
-		const lockResult = lockUserUrl(userId, url)
+		const lockResult = lockUserUrl(userId, sourceUrl)
 		if (!lockResult.ok) {
 			await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.")
 			return
@@ -1715,12 +1800,36 @@ bot.on("message:text", async (ctx, next) => {
 		let keepLock = false
 		const processing = await ctx.reply("Получаем форматы...")
 		try {
-			const isYouTube = isYouTubeUrl(url)
+			let downloadUrl = url
+			let bypassTitle: string | undefined
+			const isThreads = threadsMatcher(downloadUrl)
+			if (isThreads) {
+				const threadsUsername = getThreadsUsername(sourceUrl)
+				const threadsData = await resolveThreads(downloadUrl)
+				if (threadsData.video_url) {
+					downloadUrl = threadsData.video_url
+					bypassTitle = threadsUsername || threadsData.title
+				} else if (Array.isArray(threadsData.photo_urls)) {
+					const caption = link(
+						threadsUsername || "Threads",
+						cleanUrl(sourceUrl),
+					)
+					await sendPhotoUrls(
+						ctx,
+						threadsData.photo_urls,
+						caption,
+						ctx.message?.message_thread_id,
+						ctx.message?.message_id,
+					)
+					return
+				}
+			}
+			const isYouTube = isYouTubeUrl(downloadUrl)
 			const cookieArgsList = await cookieArgs()
 			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-			const isTiktok = urlMatcher(url, "tiktok.com")
+			const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
 			const additionalArgs = isTiktok ? tiktokArgs : []
-			const info = await safeGetInfo(url, [
+			const info = await safeGetInfo(downloadUrl, [
 				"--dump-json",
 				"--no-warnings",
 				"--no-playlist",
@@ -1742,9 +1851,11 @@ bot.on("message:text", async (ctx, next) => {
 			}
 			const filteredFormats = formats.filter((f) => f.format_id)
 			const resolvedTitle = resolveTitle(info, isTiktok)
+			const title = bypassTitle || resolvedTitle || info.title
 			requestCache.set(requestId, {
-				url,
-				title: resolvedTitle || info.title,
+				url: downloadUrl,
+				sourceUrl,
+				title,
 				formats: filteredFormats,
 				userId,
 				lockId,
@@ -1765,7 +1876,7 @@ bot.on("message:text", async (ctx, next) => {
 			await sendFormatSelector(
 				ctx,
 				requestId,
-				resolvedTitle || info.title,
+				title,
 				dashEntries.length,
 				hlsEntries.length,
 				mhtmlEntries.length,
@@ -1776,7 +1887,7 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Ошибка.")
 		} finally {
 			if (!keepLock) {
-				unlockUserUrl(userId, url, lockId)
+				unlockUserUrl(userId, sourceUrl, lockId)
 			}
 			await deleteMessage(processing)
 		}
@@ -1810,13 +1921,14 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	if (!url) return await next()
 
 	console.log(`[DEBUG] Processing URL from ${ctx.chat.id}: ${url.text}`)
+	const sourceUrl = url.text
 
 	const isPrivate = ctx.chat.type === "private"
 	const threadId = ctx.message.message_thread_id
 	let processingMessage: any
 	const userId = ctx.from?.id
 	if (!userId) return
-	const lockResult = lockUserUrl(userId, url.text)
+	const lockResult = lockUserUrl(userId, sourceUrl)
 	if (!lockResult.ok) {
 		await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.", {
 			reply_to_message_id: ctx.message.message_id,
@@ -1925,6 +2037,31 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			}
 		}
 
+		const isThreads = threadsMatcher(url.text)
+		if (isThreads) {
+			const threadsUsername = getThreadsUsername(sourceUrl)
+			const threadsData = await resolveThreads(url.text)
+			if (threadsData.video_url) {
+				url.text = threadsData.video_url
+				bypassTitle = threadsUsername || threadsData.title
+			} else if (Array.isArray(threadsData.photo_urls)) {
+				const caption = link(
+					threadsUsername || "Threads",
+					cleanUrl(sourceUrl),
+				)
+				await sendPhotoUrls(
+					ctx,
+					threadsData.photo_urls,
+					caption,
+					threadId,
+					ctx.message.message_id,
+				)
+				return
+			} else if (threadsData.error) {
+				console.error("Threads error:", threadsData.error)
+			}
+		}
+
 		const isTiktok = urlMatcher(url.text, "tiktok.com")
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -1957,7 +2094,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		// If group chat OR always download best is enabled -> Auto download
 		if (!isPrivate || ALWAYS_DOWNLOAD_BEST) {
 			autoDeleteProcessingMessage = false
-			const blockReason = getQueueBlockReason(userId, url.text, lockId)
+			const blockReason = getQueueBlockReason(userId, sourceUrl, lockId)
 			if (blockReason) {
 				await ctx.reply(blockReason, {
 					reply_to_message_id: ctx.message.message_id,
@@ -1965,7 +2102,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				})
 				return
 			}
-			enqueueJob(userId, url.text, lockId, async (signal) => {
+			enqueueJob(userId, sourceUrl, lockId, async (signal) => {
 				await downloadAndSend(
 					ctx,
 					url.text,
@@ -1975,6 +2112,10 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					title,
 					ctx.message.message_id,
 					signal,
+					false,
+					undefined,
+					false,
+					sourceUrl,
 				)
 			})
 			lockTransferred = true
@@ -1987,6 +2128,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 		requestCache.set(requestId, {
 			url: url.text,
+			sourceUrl,
 			title,
 			userId,
 			lockId,
@@ -2048,7 +2190,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			} catch {}
 		}
 		if (!keepLock && !lockTransferred) {
-			unlockUserUrl(userId, url.text, lockId)
+			unlockUserUrl(userId, sourceUrl, lockId)
 		}
 	}
 })
@@ -2112,7 +2254,11 @@ bot.on("callback_query:data", async (ctx) => {
 			}
 			const userId = ctx.from?.id
 			if (!userId) return
-			const blockReason = getQueueBlockReason(userId, cached.url, cached.lockId)
+			const blockReason = getQueueBlockReason(
+				userId,
+				getCacheLockUrl(cached),
+				cached.lockId,
+			)
 			if (blockReason) {
 				await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
 				return
@@ -2124,7 +2270,7 @@ bot.on("callback_query:data", async (ctx) => {
 			requestCache.delete(requestId)
 			await deletePreviousMenuMessage(ctx)
 			const processing = await ctx.reply("Ставим в очередь MP3...")
-			enqueueJob(userId, cached.url, cached.lockId, async (signal) => {
+			enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
 				await downloadAndSend(
 					ctx,
 					cached.url,
@@ -2134,6 +2280,10 @@ bot.on("callback_query:data", async (ctx) => {
 					cached.title,
 					ctx.callbackQuery.message?.message_id,
 					signal,
+					false,
+					undefined,
+					false,
+					cached.sourceUrl,
 				)
 			})
 			return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -2234,7 +2384,11 @@ bot.on("callback_query:data", async (ctx) => {
 		const formatString = `${videoId}+${audioId}`
 		const userId = ctx.from?.id
 		if (!userId) return
-		const blockReason = getQueueBlockReason(userId, cached.url, cached.lockId)
+		const blockReason = getQueueBlockReason(
+			userId,
+			getCacheLockUrl(cached),
+			cached.lockId,
+		)
 		if (blockReason) {
 			await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
 			return
@@ -2248,7 +2402,7 @@ bot.on("callback_query:data", async (ctx) => {
 		const processing = await ctx.reply(
 			`Ставим в очередь формат: ${formatString}...`,
 		)
-		enqueueJob(userId, cached.url, cached.lockId, async (signal) => {
+		enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
 			await downloadAndSend(
 				ctx,
 				cached.url,
@@ -2258,6 +2412,10 @@ bot.on("callback_query:data", async (ctx) => {
 				cached.title,
 				ctx.callbackQuery.message?.message_id,
 				signal,
+				false,
+				undefined,
+				false,
+				cached.sourceUrl,
 			)
 		})
 		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -2286,7 +2444,7 @@ bot.on("callback_query:data", async (ctx) => {
 	if (quality === "cancel") {
 		requestCache.delete(requestId)
 		if (cached.lockId && cached.userId) {
-			unlockUserUrl(cached.userId, cached.url, cached.lockId)
+			unlockUserUrl(cached.userId, getCacheLockUrl(cached), cached.lockId)
 		}
 		await ctx.answerCallbackQuery({ text: "Cancelled" })
 		return await ctx.deleteMessage()
@@ -2310,7 +2468,11 @@ bot.on("callback_query:data", async (ctx) => {
 		selectedFormat.acodec !== "none"
 	const userId = ctx.from?.id
 	if (!userId) return
-	const blockReason = getQueueBlockReason(userId, url, cached.lockId)
+	const blockReason = getQueueBlockReason(
+		userId,
+		getCacheLockUrl(cached),
+		cached.lockId,
+	)
 	if (blockReason) {
 		await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
 		return
@@ -2337,6 +2499,7 @@ bot.on("callback_query:data", async (ctx) => {
 			forceAudio,
 			dashFormatLabel,
 			forceHls,
+			cached.sourceUrl,
 		)
 	})
 })
