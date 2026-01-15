@@ -108,6 +108,12 @@ def resolve_threads(url):
     def extract_video_from_media(media):
         if not isinstance(media, dict):
             return None
+        if isinstance(media.get("carousel_media"), list):
+            for item in media["carousel_media"]:
+                versions = item.get("video_versions") or []
+                best = pick_best_candidate(versions)
+                if best and isinstance(best.get("url"), str):
+                    return clean_url(best["url"])
         versions = media.get("video_versions") or []
         best = pick_best_candidate(versions)
         if best and isinstance(best.get("url"), str):
@@ -185,12 +191,12 @@ def resolve_threads(url):
             if shortcode:
                 media = find_media_by_code(payload, shortcode)
                 if media:
-                    photo_urls = extract_photos_from_media(media)
-                    if photo_urls:
-                        return {"photo_urls": photo_urls, "title": "Threads Photos (SJS)"}
                     video_url = extract_video_from_media(media)
                     if video_url:
                         return {"video_url": video_url, "title": "Threads Video (SJS)"}
+                    photo_urls = extract_photos_from_media(media)
+                    if photo_urls:
+                        return {"photo_urls": photo_urls, "title": "Threads Photos (SJS)"}
 
             stack = [payload]
             while stack:
