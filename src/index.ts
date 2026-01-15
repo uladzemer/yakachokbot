@@ -170,6 +170,34 @@ const safeGetInfo = async (
 	throw new Error("No valid JSON found in yt-dlp output")
 }
 
+const safeGetInfoWithFallback = async (
+	url: string,
+	args: string[],
+	signal?: AbortSignal,
+	skipJsRuntime = false,
+	fallbackArgs: string[][] = [],
+) => {
+	let lastError: unknown
+	try {
+		return await safeGetInfo(url, args, signal, skipJsRuntime)
+	} catch (error) {
+		lastError = error
+	}
+	for (const extraArgs of fallbackArgs) {
+		try {
+			return await safeGetInfo(
+				url,
+				[...args, ...extraArgs],
+				signal,
+				skipJsRuntime,
+			)
+		} catch (error) {
+			lastError = error
+		}
+	}
+	throw lastError instanceof Error ? lastError : new Error("No valid info")
+}
+
 const fileExists = async (path: string, minSize = 1) => {
 	try {
 		const info = await stat(path)
@@ -275,6 +303,48 @@ const resolveThreads = async (url: string) => {
 		console.error("Threads resolve error", e)
 		return { error: "Failed to run bypass script" }
 	}
+}
+
+type FallbackAttempt = {
+	label: string
+	args: string[]
+}
+
+const getRefererHeaderArgs = (referer?: string) => {
+	if (!referer) return []
+	try {
+		new URL(referer)
+		return ["--add-header", `Referer: ${referer}`]
+	} catch {
+		return []
+	}
+}
+
+const buildGenericFallbacks = (referer?: string): FallbackAttempt[] => {
+	const attempts: FallbackAttempt[] = [
+		{
+			label: "Пробуем другой метод (generic)...",
+			args: ["--force-generic-extractor"],
+		},
+	]
+	const refererArgs = getRefererHeaderArgs(referer)
+	if (refererArgs.length > 0) {
+		attempts.push({
+			label: "Пробуем другой метод (generic + referer)...",
+			args: ["--force-generic-extractor", ...refererArgs],
+		})
+	}
+	return attempts
+}
+
+const shouldTryGenericFallback = (url: string) => {
+	if (!url) return false
+	if (isYouTubeUrl(url)) return false
+	if (urlMatcher(url, "tiktok.com")) return false
+	if (urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am"))
+		return false
+	if (threadsMatcher(url) || soraMatcher(url) || xfreeMatcher(url)) return false
+	return true
 }
 
 const sendPhotoUrls = async (
@@ -955,8 +1025,14 @@ const downloadAndSend = async (
 			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
 		}
 
-		const skipJsRuntimeForInfo = isYouTube
-		const info = await safeGetInfo(
+		const skipJsRuntimeForInfo =
+			isYouTube &&
+			(forceHls || formatArgs.some((arg) => arg.includes("protocol*=m3u8")))
+		const fallbackSourceUrl = sourceUrl || url
+		const genericFallbacks = shouldTryGenericFallback(fallbackSourceUrl)
+			? buildGenericFallbacks(fallbackSourceUrl)
+			: []
+		const info = await safeGetInfoWithFallback(
 			url,
 			[
 				"--dump-json",
@@ -970,6 +1046,7 @@ const downloadAndSend = async (
 			],
 			signal,
 			skipJsRuntimeForInfo,
+			genericFallbacks.map((attempt) => attempt.args),
 		)
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
@@ -1121,8 +1198,10 @@ const downloadAndSend = async (
 		if (fallbackFormatArgs && !fallbackFormatArgs.includes("--no-cache-dir")) {
 			fallbackFormatArgs.push("--no-cache-dir")
 		}
+		const formatArgsBase = [...formatArgs]
 		const usesHlsPreferred =
-			formatArgs.some((arg) => arg.includes("protocol*=m3u8")) || isHlsDownload
+			formatArgsBase.some((arg) => arg.includes("protocol*=m3u8")) ||
+			isHlsDownload
 		if (usesHlsPreferred) {
 			formatArgs.push(
 				"--downloader",
@@ -1206,6 +1285,10 @@ const downloadAndSend = async (
 				formatArgs.includes("--js-runtimes") || skipJsRuntime
 					? formatArgs
 					: [...jsRuntimeArgs, ...formatArgs]
+			const downloadArgsNative =
+				formatArgsBase.includes("--js-runtimes") || skipJsRuntime
+					? formatArgsBase
+					: [...jsRuntimeArgs, ...formatArgsBase]
 			let progressText = "Скачиваем..."
 			let fileSize = estimatedSizeLabel
 			let downloadedSize = ""
@@ -1381,18 +1464,63 @@ const downloadAndSend = async (
 						break
 					} catch (error) {
 						lastDownloadError = error
+						if (
+							!downloadSucceeded &&
+							downloadArgsNative !== downloadArgs
+						) {
+							if (statusMessageId) {
+								await updateMessage(
+									ctx,
+									statusMessageId,
+									`Обработка: <b>${title}</b>\nСтатус: HLS: пробуем без ffmpeg...`,
+								)
+							}
+							try {
+								await runDownload(
+									downloadArgsNative,
+									attempt.extraArgs,
+									attempt.cookies,
+								)
+								downloadSucceeded = true
+								break
+							} catch (nativeError) {
+								lastDownloadError = nativeError
+							}
+						}
 					}
+					if (downloadSucceeded) break
 				}
 			} else {
+				const baseExtraArgs = [
+					...hlsPoTokenArgs,
+					...impersonateArgs,
+					...youtubeArgs,
+				]
 				try {
-					await runDownload(
-						downloadArgs,
-						[...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
-						cookieArgsList,
-					)
+					await runDownload(downloadArgs, baseExtraArgs, cookieArgsList)
 					downloadSucceeded = true
 				} catch (error) {
 					lastDownloadError = error
+					for (const attempt of genericFallbacks) {
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								`Обработка: <b>${title}</b>\nСтатус: ${attempt.label}`,
+							)
+						}
+						try {
+							await runDownload(
+								[...downloadArgs, ...attempt.args],
+								baseExtraArgs,
+								cookieArgsList,
+							)
+							downloadSucceeded = true
+							break
+						} catch (fallbackError) {
+							lastDownloadError = fallbackError
+						}
+					}
 				}
 			}
 
@@ -1829,15 +1957,24 @@ bot.on("message:text", async (ctx, next) => {
 			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 			const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
 			const additionalArgs = isTiktok ? tiktokArgs : []
-			const info = await safeGetInfo(downloadUrl, [
-				"--dump-json",
-				"--no-warnings",
-				"--no-playlist",
-				...cookieArgsList,
-				...additionalArgs,
-				...impersonateArgs,
-				...youtubeArgs,
-			])
+			const genericFallbacks = shouldTryGenericFallback(sourceUrl)
+				? buildGenericFallbacks(sourceUrl)
+				: []
+			const info = await safeGetInfoWithFallback(
+				downloadUrl,
+				[
+					"--dump-json",
+					"--no-warnings",
+					"--no-playlist",
+					...cookieArgsList,
+					...additionalArgs,
+					...impersonateArgs,
+					...youtubeArgs,
+				],
+				undefined,
+				false,
+				genericFallbacks.map((attempt) => attempt.args),
+			)
 
 			if (!info.formats || info.formats.length === 0) {
 				await ctx.reply("No formats found.")
@@ -2076,17 +2213,26 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 
 		// Check available formats
-		const info = await safeGetInfo(url.text, [
-			"--dump-json",
-			"--no-warnings",
-			"-q",
-			"--no-progress",
-			"--no-playlist",
-			...cookieArgsList,
-			...additionalArgs,
-			...impersonateArgs,
-			...youtubeArgs,
-		])
+		const genericFallbacks = shouldTryGenericFallback(sourceUrl)
+			? buildGenericFallbacks(sourceUrl)
+			: []
+		const info = await safeGetInfoWithFallback(
+			url.text,
+			[
+				"--dump-json",
+				"--no-warnings",
+				"-q",
+				"--no-progress",
+				"--no-playlist",
+				...cookieArgsList,
+				...additionalArgs,
+				...impersonateArgs,
+				...youtubeArgs,
+			],
+			undefined,
+			false,
+			genericFallbacks.map((attempt) => attempt.args),
+		)
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 		const title = bypassTitle || resolvedTitle || removeHashtagsMentions(info.title)
