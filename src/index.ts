@@ -575,6 +575,22 @@ const sanitizeFilePart = (value: string, fallback: string) => {
 	return cleaned || fallback
 }
 
+const resolveTitle = (info: any, isTiktok: boolean) => {
+	const rawTitle = removeHashtagsMentions(`${info?.title || ""}`.trim()).trim()
+	const normalizedTitle = rawTitle.toLowerCase()
+	if (rawTitle && (!isTiktok || normalizedTitle !== "tiktok video")) {
+		return rawTitle
+	}
+	if (isTiktok) {
+		const uploader = `${info?.uploader || info?.uploader_id || info?.creator || ""}`
+			.trim()
+		if (uploader) {
+			return uploader.startsWith("@") ? uploader : `@${uploader}`
+		}
+	}
+	return ""
+}
+
 const buildFormatsTable = (entries: FormatEntry[]) => {
 	let output =
 		"ID | EXT | RES | FPS | TBR | SIZE | VCODEC | ACODEC | PROTO | NOTE\n" +
@@ -873,7 +889,8 @@ const downloadAndSend = async (
 			skipJsRuntimeForInfo,
 		)
 
-		const title = overrideTitle || removeHashtagsMentions(info.title)
+		const resolvedTitle = resolveTitle(info, isTiktok)
+		const title = overrideTitle || resolvedTitle
 		const caption = link(title || "Video", cleanUrl(url))
 		const safeTitle = sanitizeFilePart(title || "video", "video")
 		const formatTail = formatLabelTail
@@ -1084,7 +1101,7 @@ const downloadAndSend = async (
 				caption,
 				parse_mode: "HTML",
 				performer: info.uploader,
-				title: info.title,
+				title: title || info.title,
 				thumbnail: getThumbnail(info.thumbnails),
 				duration: info.duration,
 				message_thread_id: threadId,
@@ -1701,7 +1718,8 @@ bot.on("message:text", async (ctx, next) => {
 			const isYouTube = isYouTubeUrl(url)
 			const cookieArgsList = await cookieArgs()
 			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-			const additionalArgs = urlMatcher(url, "tiktok.com") ? tiktokArgs : []
+			const isTiktok = urlMatcher(url, "tiktok.com")
+			const additionalArgs = isTiktok ? tiktokArgs : []
 			const info = await safeGetInfo(url, [
 				"--dump-json",
 				"--no-warnings",
@@ -1723,9 +1741,10 @@ bot.on("message:text", async (ctx, next) => {
 				throw new Error("Failed to generate request ID.")
 			}
 			const filteredFormats = formats.filter((f) => f.format_id)
+			const resolvedTitle = resolveTitle(info, isTiktok)
 			requestCache.set(requestId, {
 				url,
-				title: info.title,
+				title: resolvedTitle || info.title,
 				formats: filteredFormats,
 				userId,
 				lockId,
@@ -1746,7 +1765,7 @@ bot.on("message:text", async (ctx, next) => {
 			await sendFormatSelector(
 				ctx,
 				requestId,
-				info.title,
+				resolvedTitle || info.title,
 				dashEntries.length,
 				hlsEntries.length,
 				mhtmlEntries.length,
@@ -1932,7 +1951,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			...youtubeArgs,
 		])
 
-		const title = bypassTitle || removeHashtagsMentions(info.title)
+		const resolvedTitle = resolveTitle(info, isTiktok)
+		const title = bypassTitle || resolvedTitle || removeHashtagsMentions(info.title)
 
 		// If group chat OR always download best is enabled -> Auto download
 		if (!isPrivate || ALWAYS_DOWNLOAD_BEST) {
