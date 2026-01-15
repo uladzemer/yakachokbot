@@ -1,6 +1,14 @@
-import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises"
+import {
+	mkdir,
+	readdir,
+	readFile,
+	rm,
+	rename,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises"
 import { dirname, resolve } from "node:path"
-import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
@@ -126,60 +134,33 @@ const fileExists = async (path: string, minSize = 1) => {
 	}
 }
 
-const renderMhtmlPreview = async (inputPath: string, outputBase: string) => {
-	const htmlPath = `${outputBase}.html`
-	let previewSource = inputPath
-	try {
-		await execFilePromise("python3", [
-			"src/mhtml_extract.py",
-			inputPath,
-			htmlPath,
-		])
-		if (await fileExists(htmlPath, 16)) {
-			previewSource = htmlPath
-		}
-	} catch (error) {
-		console.error("MHTML HTML extract error:", error)
+const formatBytes = (bytes: number) => {
+	if (!Number.isFinite(bytes) || bytes <= 0) return ""
+	const units = ["B", "KiB", "MiB", "GiB", "TiB"]
+	let value = bytes
+	let unitIndex = 0
+	while (value >= 1024 && unitIndex < units.length - 1) {
+		value /= 1024
+		unitIndex += 1
 	}
+	const precision = value >= 10 || unitIndex === 0 ? 0 : 1
+	return `${value.toFixed(precision)}${units[unitIndex]}`
+}
 
-	const fileUrl = pathToFileURL(previewSource).toString()
-	const commonArgs = [
-		"--headless",
-		"--no-sandbox",
-		"--disable-gpu",
-		"--disable-dev-shm-usage",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--allow-file-access-from-files",
-		"--window-size=1280,720",
-		"--hide-scrollbars",
-		"--virtual-time-budget=5000",
-	]
-	const pngPath = `${outputBase}.png`
-	try {
-		await execFilePromise("chromium", [
-			...commonArgs,
-			`--screenshot=${pngPath}`,
-			fileUrl,
-		])
-		if (await fileExists(pngPath, 1024)) return pngPath
-	} catch (error) {
-		console.error("MHTML image render error:", error)
+const parseHmsToSeconds = (value: string) => {
+	const match = value.match(/(\d+):(\d+):(\d+(?:\.\d+)?)/)
+	if (!match) return undefined
+	const hours = Number(match[1])
+	const minutes = Number(match[2])
+	const seconds = Number(match[3])
+	if (
+		!Number.isFinite(hours) ||
+		!Number.isFinite(minutes) ||
+		!Number.isFinite(seconds)
+	) {
+		return undefined
 	}
-
-	const pdfPath = `${outputBase}.pdf`
-	try {
-		await execFilePromise("chromium", [
-			...commonArgs,
-			`--print-to-pdf=${pdfPath}`,
-			fileUrl,
-		])
-		if (await fileExists(pdfPath, 1024)) return pdfPath
-	} catch (error) {
-		console.error("MHTML PDF render error:", error)
-	}
-
-	return undefined
+	return hours * 3600 + minutes * 60 + seconds
 }
 
 const isYouTubeUrl = (url: string) => {
@@ -510,6 +491,45 @@ const buildFormatButtonText = (entry: FormatEntry) => {
 	return buttonText
 }
 
+const buildFormatFilenameLabel = (format: any) => {
+	const entry: FormatEntry = { format, meta: getFormatMeta(format) }
+	const f = entry.format
+	const { codecLabel, bitrate, isDash } = entry.meta
+	const filesize = f.filesize
+		? `${(f.filesize / 1024 / 1024).toFixed(1)}MiB`
+		: f.filesize_approx
+			? `~${(f.filesize_approx / 1024 / 1024).toFixed(1)}MiB`
+			: "N/A"
+	const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "")
+
+	let label = f.format_id || "format"
+	if (res) {
+		label += ` ${res}`
+	} else if (f.acodec !== "none" && f.vcodec === "none") {
+		label += " audio"
+	}
+	if (isDash) {
+		label += " dash"
+	}
+	if (codecLabel) {
+		label += ` ${codecLabel}`
+	}
+	if (bitrate) {
+		label += ` ${bitrate}`
+	}
+	label += ` (${filesize})`
+	return label
+}
+
+const sanitizeFilePart = (value: string, fallback: string) => {
+	const cleaned = value
+		.trim()
+		.replace(/\s+/g, "_")
+		.replace(/[^A-Za-z0-9._-]/g, "_")
+		.replace(/_+/g, "_")
+	return cleaned || fallback
+}
+
 const buildFormatsTable = (entries: FormatEntry[]) => {
 	let output =
 		"ID | EXT | RES | FPS | TBR | SIZE | VCODEC | ACODEC | PROTO | NOTE\n" +
@@ -581,10 +601,10 @@ const sendFormatSection = async (
 			message_thread_id: threadId,
 		})
 		const keyboard = new InlineKeyboard()
+		keyboard.text("Назад", `f:${requestId}:back`).row()
 		if (allowCombine) {
 			keyboard.text("Объединить форматы", `c:${requestId}`).row()
 		}
-		keyboard.text("Назад", `f:${requestId}:back`).row()
 		await ctx.reply(`Actions for: ${title}`, {
 			reply_markup: keyboard,
 			message_thread_id: threadId,
@@ -593,13 +613,13 @@ const sendFormatSection = async (
 	}
 
 	const keyboard = new InlineKeyboard()
-	if (allowCombine) {
-		keyboard.text("Объединить форматы", `c:${requestId}`).row()
-	}
 	for (const entry of entries) {
 		keyboard
 			.text(buildFormatButtonText(entry), `d:${requestId}:${entry.format.format_id}`)
 			.row()
+	}
+	if (allowCombine) {
+		keyboard.text("Объединить форматы", `c:${requestId}`).row()
 	}
 	keyboard.text("Назад", `f:${requestId}:back`).row()
 	await ctx.reply(`Select ${label} format for: ${title}`, {
@@ -705,6 +725,7 @@ const downloadAndSend = async (
 	replyToMessageId?: number,
 	signal?: AbortSignal,
 	forceAudio = false,
+	formatLabelTail?: string,
 ) => {
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
@@ -712,7 +733,6 @@ const downloadAndSend = async (
 	await mkdir(tempDir, { recursive: true })
 	let tempFilePath = resolve(tempDir, "video.mp4")
 	const tempThumbPath = resolve(tempDir, "thumb.jpg")
-	const tempPreviewBase = resolve(tempDir, "preview")
 	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
 	
 	try {
@@ -727,6 +747,7 @@ const downloadAndSend = async (
 		const isMp3Format = isRawFormat && quality === "mp3"
 		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
 		let formatArgs: string[] = []
+		let fallbackFormatArgs: string[] | undefined
 		if (isRawFormat) {
 			if (isMp3Format) {
 				formatArgs = ["-f", "251", "-x", "--audio-format", "mp3"]
@@ -736,15 +757,37 @@ const downloadAndSend = async (
 		} else if (quality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
 		} else if (quality === "b") {
-			formatArgs = [
-				"-f",
-				"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-			]
+			if (isYouTube) {
+				formatArgs = [
+					"-f",
+					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+				fallbackFormatArgs = [
+					"-f",
+					"bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+			} else {
+				formatArgs = [
+					"-f",
+					"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+			}
 		} else {
-			formatArgs = [
-				"-f",
-				`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
-			]
+			if (isYouTube) {
+				formatArgs = [
+					"-f",
+					`best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+				]
+				fallbackFormatArgs = [
+					"-f",
+					`bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+				]
+			} else {
+				formatArgs = [
+					"-f",
+					`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+				]
+			}
 		}
 
 		console.log(`[QUEUE] Starting download: ${url} (Quality: ${quality}) in chat ${ctx.chat.id}`)
@@ -770,6 +813,11 @@ const downloadAndSend = async (
 
 		const title = overrideTitle || removeHashtagsMentions(info.title)
 		const caption = link(title || "Video", cleanUrl(url))
+		const safeTitle = sanitizeFilePart(title || "video", "video")
+		const formatTail = formatLabelTail
+			? sanitizeFilePart(formatLabelTail, "")
+			: ""
+		const dashFileBase = formatTail ? `${safeTitle}_${formatTail}` : ""
 		const maxUploadSize = 2 * 1024 * 1024 * 1024
 		const sizeCandidates: number[] = []
 		if (typeof info.filesize === "number") sizeCandidates.push(info.filesize)
@@ -795,6 +843,7 @@ const downloadAndSend = async (
 		const estimatedSize = sizeCandidates.length
 			? Math.max(...sizeCandidates)
 			: 0
+		const estimatedSizeLabel = estimatedSize ? formatBytes(estimatedSize) : ""
 		if (estimatedSize >= maxUploadSize) {
 			const limitMessage = "Можно загрузить файлы до 2ГБ"
 			if (statusMessageId) {
@@ -812,9 +861,12 @@ const downloadAndSend = async (
 			: []
 		const isCombined = isRawFormat && requestedFormats.length > 1
 		let outputContainer: "mp4" | "webm" | "mkv" = "mp4"
+		let audioTranscodeCodec: "aac" | "opus" | null = null
+		let audioTranscodeBitrate = "256k"
 		const formatNote = `${info.format_note || ""}`.toLowerCase()
 		const formatLine = `${info.format || ""}`.toLowerCase()
 		const formatProtocol = `${info.protocol || ""}`.toLowerCase()
+		let resolvedVideoCodec = info.vcodec || ""
 		const isMhtml =
 			info.ext === "mhtml" ||
 			`${info.format_id || ""}`.startsWith("sb") ||
@@ -838,28 +890,46 @@ const downloadAndSend = async (
 				)
 				combinedVideoCodec = videoFormat?.vcodec || vcodec
 				combinedAudioCodec = audioFormat?.acodec || acodec
+				resolvedVideoCodec = combinedVideoCodec
+				const isAv1Video = /av01/i.test(combinedVideoCodec)
 				const isWebmVideo = /vp0?8|vp0?9|av01/i.test(combinedVideoCodec)
 				const isWebmAudio = /opus|vorbis/i.test(combinedAudioCodec)
 				const isMp4Video = /avc|h264|hevc|h265/i.test(combinedVideoCodec)
 				const isMp4Audio = /mp4a|aac/i.test(combinedAudioCodec)
 
-				if (isWebmVideo && isWebmAudio) {
-					outputContainer = "webm"
-				} else if (isMp4Video && isMp4Audio) {
+				if (isAv1Video && isWebmAudio) {
 					outputContainer = "mp4"
+					audioTranscodeCodec = "aac"
+					audioTranscodeBitrate = "320k"
+				} else if (isWebmVideo && isWebmAudio) {
+					outputContainer = "webm"
+				} else if ((isMp4Video && isMp4Audio) || (isAv1Video && isMp4Audio)) {
+					outputContainer = "mp4"
+				} else if (isMp4Video || isAv1Video) {
+					outputContainer = "mp4"
+					audioTranscodeCodec = "aac"
+					if (isWebmAudio) {
+						audioTranscodeBitrate = "320k"
+					}
+				} else if (isWebmVideo) {
+					outputContainer = "webm"
+					audioTranscodeCodec = "opus"
 				} else {
 					outputContainer = "mkv"
 				}
 				if (isInstagram) {
 					outputContainer = "mp4"
+					if (audioTranscodeCodec === "opus") {
+						audioTranscodeCodec = "aac"
+						audioTranscodeBitrate = "256k"
+					}
 				}
 			} else {
 				outputContainer = info.ext === "webm" ? "webm" : info.ext === "mkv" ? "mkv" : "mp4"
 			}
 
-			if (outputContainer !== "mp4") {
-				tempFilePath = resolve(tempDir, `video.${outputContainer}`)
-			}
+			const videoBase = dashFileBase || safeTitle
+			tempFilePath = resolve(tempDir, `${videoBase}.${outputContainer}`)
 
 			if (!isMhtml) {
 				formatArgs.push("--merge-output-format", outputContainer)
@@ -868,15 +938,34 @@ const downloadAndSend = async (
 		if (!formatArgs.includes("--no-cache-dir")) {
 			formatArgs.push("--no-cache-dir")
 		}
+		if (fallbackFormatArgs && !fallbackFormatArgs.includes("--no-cache-dir")) {
+			fallbackFormatArgs.push("--no-cache-dir")
+		}
+		const usesHlsPreferred = formatArgs.some((arg) =>
+			arg.includes("protocol*=m3u8"),
+		)
+		if (usesHlsPreferred) {
+			formatArgs.push(
+				"--downloader",
+				"ffmpeg",
+				"--hls-prefer-ffmpeg",
+				"--retries",
+				"1",
+				"--fragment-retries",
+				"1",
+				"--abort-on-unavailable-fragment",
+			)
+		}
 
 		if (isAudioRequest) {
 			const downloadArgs = formatArgs.includes("--js-runtimes")
 				? formatArgs
 				: [...jsRuntimeArgs, ...formatArgs]
+			const audioBase = dashFileBase || "audio"
 			if (isMp3Format) {
-				tempFilePath = resolve(tempDir, "audio.mp3")
+				tempFilePath = resolve(tempDir, `${audioBase}.mp3`)
 			} else if (info.ext && info.ext !== "none") {
-				tempFilePath = resolve(tempDir, `audio.${info.ext}`)
+				tempFilePath = resolve(tempDir, `${audioBase}.${info.ext}`)
 			}
 			if (statusMessageId) {
 				await updateMessage(
@@ -937,23 +1026,62 @@ const downloadAndSend = async (
 				? formatArgs
 				: [...jsRuntimeArgs, ...formatArgs]
 			let progressText = "Скачиваем..."
-			let fileSize = ""
+			let fileSize = estimatedSizeLabel
+			let downloadedSize = ""
 			let lastProgressAt = Date.now()
+			let progressBuffer = ""
+			let progressStage: "download" | "muxing" | "converting" = "download"
+			const durationSeconds =
+				typeof info.duration === "number" && info.duration > 0
+					? info.duration
+					: undefined
 			const containerLabel = outputContainer.toUpperCase()
 			const muxingLabel = `Муксинг в ${containerLabel}...`
 			const convertingLabel = `Конвертируем в ${containerLabel}...`
-			const onProgress = (data: string) => {
+			const handleProgressLine = (line: string) => {
 				if (!statusMessageId) return
-				const lower = data.toLowerCase()
+				const trimmed = line.trim()
+				if (!trimmed) return
+				const lower = trimmed.toLowerCase()
 				lastProgressAt = Date.now()
 
-				if (data.includes("[download]")) {
-					const sizeMatch = data.match(/of\s+(?:~?\s*)?([\d.,]+\s*\w+B)/)
+				if (
+					trimmed.includes("[Merger]") ||
+					lower.includes("merging formats into") ||
+					(lower.includes("[ffmpeg]") && lower.includes("merge"))
+				) {
+					progressStage = "muxing"
+					progressText = muxingLabel
+					return updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
+					)
+				}
+
+				if (
+					trimmed.includes("[VideoConvertor]") ||
+					lower.includes("converting") ||
+					(lower.includes("[ffmpeg]") && lower.includes("conversion"))
+				) {
+					progressStage = "converting"
+					progressText = convertingLabel
+					return updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
+					)
+				}
+
+				if (progressStage !== "download") return
+
+				if (trimmed.includes("[download]")) {
+					const sizeMatch = trimmed.match(/of\s+(?:~?\s*)?([\d.,]+\s*\w+B)/)
 					if (sizeMatch?.[1]) {
 						fileSize = sizeMatch[1]
 					}
 
-					const percentageMatch = data.match(/(\d+(?:[.,]\d+)?)%/)
+					const percentageMatch = trimmed.match(/(\d+(?:[.,]\d+)?)%/)
 					if (percentageMatch) {
 						progressText = `Скачиваем: ${percentageMatch[1]}%`
 						if (fileSize) {
@@ -963,25 +1091,51 @@ const downloadAndSend = async (
 							progressText = muxingLabel
 						}
 					}
-				} else if (
-					data.includes("[Merger]") ||
-					lower.includes("merging formats into") ||
-					(lower.includes("[ffmpeg]") && lower.includes("merge"))
-				) {
-					progressText = muxingLabel
-				} else if (
-					data.includes("[VideoConvertor]") ||
-					lower.includes("converting") ||
-					(lower.includes("[ffmpeg]") && lower.includes("conversion"))
-				) {
-					progressText = convertingLabel
+					return updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
+					)
 				}
 
-				updateMessage(
-					ctx,
-					statusMessageId,
-					`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
-				)
+				const timeMatch = trimmed.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/)
+				if (timeMatch && durationSeconds) {
+					const timeSeconds = parseHmsToSeconds(timeMatch[1])
+					if (typeof timeSeconds === "number") {
+						const percent = Math.min(
+							100,
+							(timeSeconds / durationSeconds) * 100,
+						)
+						const percentLabel = percent.toFixed(1).replace(/\.0$/, "")
+						progressText = `Скачиваем: ${percentLabel}%`
+						const sizeMatch = trimmed.match(
+							/size=\s*([0-9.]+\s*[A-Za-z]+B)/,
+						)
+						if (sizeMatch?.[1]) {
+							downloadedSize = sizeMatch[1].replace(/\s+/g, "")
+						}
+						if (fileSize) {
+							progressText += ` из ${fileSize}`
+						} else if (downloadedSize) {
+							progressText += ` (${downloadedSize})`
+						}
+						return updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
+						)
+					}
+				}
+			}
+
+			const onProgress = (data: string) => {
+				if (!statusMessageId) return
+				progressBuffer += data
+				const lines = progressBuffer.split(/\r?\n|\r/)
+				progressBuffer = lines.pop() || ""
+				for (const line of lines) {
+					handleProgressLine(line)
+				}
 			}
 
 			let statusHeartbeat: NodeJS.Timeout | undefined
@@ -1016,20 +1170,59 @@ const downloadAndSend = async (
 					onProgress,
 					signal,
 				)
+			} catch (error) {
+				if (!fallbackFormatArgs) throw error
+				const retryArgs = fallbackFormatArgs.includes("--js-runtimes")
+					? fallbackFormatArgs
+					: [...jsRuntimeArgs, ...fallbackFormatArgs]
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: HLS недоступен, пробуем другое...`,
+					)
+				}
+				await spawnPromise(
+					"yt-dlp",
+					[
+						url,
+						...retryArgs,
+						"-o",
+						tempFilePath,
+						"--no-part",
+						"--no-warnings",
+						"--no-playlist",
+						...cookieArgsList,
+						...additionalArgs,
+						...impersonateArgs,
+						...youtubeArgs,
+					],
+					onProgress,
+					signal,
+				)
 			} finally {
 				if (statusHeartbeat) clearInterval(statusHeartbeat)
 			}
 
 			const hasVideoTrack = info.vcodec && info.vcodec !== "none"
-			if (
+			const needsAudioFix =
 				(isTiktok || isInstagram) &&
 				hasVideoTrack &&
 				!isMhtml &&
 				outputContainer === "mp4" &&
 				!isMp3Format &&
 				quality !== "audio"
-			) {
-				const audioFixedPath = resolve(tempDir, "audio-fixed.mp4")
+
+			if (needsAudioFix && !audioTranscodeCodec) {
+				audioTranscodeCodec = "aac"
+			}
+
+			if (audioTranscodeCodec && !isMhtml && !isMp3Format && quality !== "audio") {
+				const outputBasePath = tempFilePath
+				const audioFixedPath = resolve(
+					tempDir,
+					`audio-fixed.${outputContainer}`,
+				)
 				try {
 					if (statusMessageId) {
 						await updateMessage(
@@ -1038,37 +1231,50 @@ const downloadAndSend = async (
 							`Обработка: <b>${title}</b>\nСтатус: Конвертируем аудио...`,
 						)
 					}
-					await spawnPromise(
-						"ffmpeg",
-						[
-							"-y",
-							"-i",
-							tempFilePath,
-							"-c:v",
-							"copy",
-							"-c:a",
-							"aac",
+					const ffmpegArgs = [
+						"-y",
+						"-i",
+						tempFilePath,
+						"-c:v",
+						"copy",
+						"-c:a",
+						audioTranscodeCodec === "aac" ? "aac" : "libopus",
+					]
+					if (audioTranscodeCodec === "aac") {
+						ffmpegArgs.push(
 							"-profile:a",
 							"aac_low",
 							"-b:a",
-							"256k",
+							audioTranscodeBitrate,
 							"-ar",
 							"48000",
-							"-movflags",
-							"+faststart",
-							audioFixedPath,
-						],
+						)
+						if (outputContainer === "mp4") {
+							ffmpegArgs.push("-movflags", "+faststart")
+						}
+					} else {
+						ffmpegArgs.push("-b:a", "160k")
+					}
+					ffmpegArgs.push(audioFixedPath)
+					await spawnPromise(
+						"ffmpeg",
+						ffmpegArgs,
 						undefined,
 						signal,
 					)
 					if (await fileExists(audioFixedPath, 1024)) {
-						await unlink(tempFilePath)
-						tempFilePath = audioFixedPath
+						await unlink(outputBasePath)
+						try {
+							await rename(audioFixedPath, outputBasePath)
+							tempFilePath = outputBasePath
+						} catch {
+							tempFilePath = audioFixedPath
+						}
 					} else {
 						await unlink(audioFixedPath)
 					}
 				} catch (error) {
-					console.error("TikTok audio convert error:", error)
+					console.error("Audio convert error:", error)
 					try {
 						await unlink(audioFixedPath)
 					} catch {}
@@ -1076,17 +1282,15 @@ const downloadAndSend = async (
 			}
 
 			if (isMhtml) {
-				try {
-					const previewPath = await renderMhtmlPreview(tempFilePath, tempPreviewBase)
-					if (previewPath) {
-						await ctx.replyWithChatAction("upload_document")
-						await ctx.replyWithDocument(new InputFile(previewPath), {
-							caption: "Preview",
-							message_thread_id: threadId,
-						})
+				const fileBase = sanitizeFilePart(title || "mhtml", "mhtml")
+				const namedPath = resolve(tempDir, `${fileBase}.mhtml`)
+				if (namedPath !== tempFilePath) {
+					try {
+						await rename(tempFilePath, namedPath)
+						tempFilePath = namedPath
+					} catch (error) {
+						console.error("MHTML rename error:", error)
 					}
-				} catch (error) {
-					console.error("MHTML preview send error:", error)
 				}
 				if (statusMessageId) {
 					await updateMessage(
@@ -1122,6 +1326,7 @@ const downloadAndSend = async (
 					const width = metadata.width || info.width
 					const height = metadata.height || info.height
 					const duration = metadata.duration || info.duration
+					const isAv1Video = /av01|av1/i.test(resolvedVideoCodec)
 
 					// Generate local thumbnail to ensure correct aspect ratio in Telegram
 					await generateThumbnail(tempFilePath, tempThumbPath)
@@ -1138,7 +1343,8 @@ const downloadAndSend = async (
 					}
 
 					await ctx.replyWithChatAction("upload_video")
-					const supportsStreaming = outputContainer === "mp4" && !isTiktok
+					const supportsStreaming =
+						outputContainer === "mp4" && !isTiktok && !isAv1Video
 					await ctx.replyWithVideo(video, {
 						caption,
 						parse_mode: "HTML",
@@ -1922,6 +2128,11 @@ bot.on("callback_query:data", async (ctx) => {
 	const selectedFormat = cached.formats?.find(
 		(f: any) => `${f?.format_id}` === quality,
 	)
+	const selectedMeta = selectedFormat ? getFormatMeta(selectedFormat) : undefined
+	const dashFormatLabel =
+		isRawFormat && selectedMeta?.isDash && !selectedMeta.isMhtml
+			? buildFormatFilenameLabel(selectedFormat)
+			: undefined
 	const forceAudio =
 		!!selectedFormat &&
 		selectedFormat.vcodec === "none" &&
@@ -1954,6 +2165,7 @@ bot.on("callback_query:data", async (ctx) => {
 			ctx.callbackQuery.message?.reply_to_message?.message_id,
 			signal,
 			forceAudio,
+			dashFormatLabel,
 		)
 	})
 })
@@ -1977,4 +2189,3 @@ bot.on("message:text", async (ctx) => {
 		)
 	}
 })
-
