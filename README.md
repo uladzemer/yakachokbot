@@ -45,6 +45,18 @@ docker compose up -d
 - Куки складывайте в `./yakachokbot/cookies.txt`.
 - В `./yakachokbot` также хранится `saved-translations.json`, если включены авто‑переводы.
 
+## Как получить cookies.txt
+
+1) Установите расширение для Chrome: https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+2) Откройте YouTube и войдите в нужный аккаунт.
+3) Нажмите на расширение и выберите экспорт в формате Netscape cookies.txt.
+4) Сохраните файл как `cookies.txt` и положите его в `./yakachokbot/`.
+5) Перезапустите контейнер:
+
+```bash
+docker compose restart telegram-bot
+```
+
 [yt-dlp]: https://github.com/yt-dlp/yt-dlp
 [telegram-api-id]: https://core.telegram.org/api/obtaining_api_id
 [id-bot]: https://t.me/getidsbot
