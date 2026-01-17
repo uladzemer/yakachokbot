@@ -5,6 +5,8 @@ import { hydrateReply } from "@grammyjs/parse-mode"
 import express from "express"
 import { Bot, webhookCallback } from "grammy"
 import { API_ROOT, BOT_TOKEN, WEBHOOK_PORT, WEBHOOK_URL, ADMIN_ID } from "./environment"
+import { code, bold } from "./constants"
+import { cutoffWithNotice } from "./util"
 
 export const bot = new Bot<ParseModeFlavor<Context>>(BOT_TOKEN, {
 	client: { apiRoot: API_ROOT },
@@ -12,6 +14,27 @@ export const bot = new Bot<ParseModeFlavor<Context>>(BOT_TOKEN, {
 })
 
 bot.use(hydrateReply)
+
+bot.catch(async (err) => {
+	try {
+		const title = bold("Ошибка бота.")
+		const context = err.ctx?.update ? `Update: ${err.ctx.update.update_id}` : ""
+		const details =
+			err.error instanceof Error
+				? err.error.stack || err.error.message
+				: String(err.error)
+		const message = [
+			title,
+			context,
+			code(cutoffWithNotice(details)),
+		]
+			.filter(Boolean)
+			.join("\n\n")
+		await bot.api.sendMessage(ADMIN_ID, message, { parse_mode: "HTML" })
+	} catch (error) {
+		console.error("Failed to notify admin about bot error:", error)
+	}
+})
 
 export const server = express()
 

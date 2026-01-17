@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
-import { link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
+import { bold, code, link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
@@ -30,7 +30,7 @@ import { Queue } from "./queue"
 import { bot } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
-import { chunkArray, removeHashtagsMentions, cleanUrl } from "./util"
+import { chunkArray, removeHashtagsMentions, cleanUrl, cutoffWithNotice } from "./util"
 import { execFile, spawn, type ExecFileOptions } from "node:child_process"
 
 const TEMP_PREFIX = "yakachokbot-"
@@ -40,6 +40,28 @@ const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 const cleanupMaxAgeHours = Number.isFinite(CLEANUP_MAX_AGE_HOURS)
 	? Math.max(1, CLEANUP_MAX_AGE_HOURS)
 	: 12
+
+const notifyAdminLog = async (title: string, error: unknown) => {
+	try {
+		const details =
+			error instanceof Error ? error.stack || error.message : String(error)
+		const message = [
+			bold(title),
+			code(cutoffWithNotice(details)),
+		].join("\n\n")
+		await bot.api.sendMessage(ADMIN_ID, message, { parse_mode: "HTML" })
+	} catch (notifyError) {
+		console.error("Failed to notify admin:", notifyError)
+	}
+}
+
+process.on("unhandledRejection", (reason) => {
+	notifyAdminLog("Unhandled promise rejection", reason)
+})
+
+process.on("uncaughtException", (error) => {
+	notifyAdminLog("Uncaught exception", error)
+})
 
 const cleanupTempDirs = async () => {
 	const now = Date.now()
