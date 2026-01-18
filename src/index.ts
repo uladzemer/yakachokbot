@@ -1567,14 +1567,15 @@ const downloadAndSend = async (
 								(lastPercentValue === null || rawPercent >= lastPercentValue)
 							) {
 								lastPercentValue = rawPercent
-								progressText = `Скачиваем: ${percentValueRaw}%`
 							}
+							let nextText = `Скачиваем: ${percentValueRaw}%`
 							if (fileSize) {
-								progressText += ` из ${fileSize}`
+								nextText += ` из ${fileSize}`
 							}
 							if (percentValueRaw === "100.0" && isCombined) {
-								progressText = muxingLabel
+								nextText = muxingLabel
 							}
+							progressText = nextText
 						}
 						return updateMessage(
 							ctx,
@@ -1600,19 +1601,20 @@ const downloadAndSend = async (
 								return
 							}
 							lastPercentValue = percent
-							progressText = `Скачиваем: ${percentLabel}%`
+							let nextText = `Скачиваем: ${percentLabel}%`
 							const sizeMatch = trimmed.match(
 								/size=\s*([0-9.]+\s*[A-Za-z]+B)/,
-						)
-						if (sizeMatch?.[1]) {
-							downloadedSize = sizeMatch[1].replace(/\s+/g, "")
-						}
-						if (fileSize) {
-							progressText += ` из ${fileSize}`
-						} else if (downloadedSize) {
-							progressText += ` (${downloadedSize})`
-						}
-						return updateMessage(
+							)
+							if (sizeMatch?.[1]) {
+								downloadedSize = sizeMatch[1].replace(/\s+/g, "")
+							}
+							if (fileSize) {
+								nextText += ` из ${fileSize}`
+							} else if (downloadedSize) {
+								nextText += ` (${downloadedSize})`
+							}
+							progressText = nextText
+							return updateMessage(
 							ctx,
 							statusMessageId,
 							`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
