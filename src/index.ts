@@ -253,6 +253,7 @@ const getFlatPlaylistEntries = async (
 ) => {
 	try {
 		const normalizedPlaylistUrl = url.replace(/\/+$/, "")
+		const isErome = /(^|\.)erome\.com$/i.test(new URL(normalizedPlaylistUrl).hostname)
 		const { stdout } = await execFilePromise(
 			"yt-dlp",
 			[
@@ -283,7 +284,19 @@ const getFlatPlaylistEntries = async (
 				if (normalizedEntry === normalizedPlaylistUrl) continue
 				if (!normalized || seen.has(normalized)) continue
 				seen.add(normalized)
-				entries.push({ url: normalized, title: data?.title })
+				let title = data?.title
+				if (isErome) {
+					const playlistTitle =
+						typeof data?.playlist_title === "string"
+							? data.playlist_title
+							: typeof data?.playlist === "string"
+								? data.playlist
+								: ""
+					if (playlistTitle) {
+						title = `${playlistTitle} (${entries.length + 1})`
+					}
+				}
+				entries.push({ url: normalized, title })
 			} catch {}
 		}
 		return entries
