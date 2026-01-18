@@ -44,7 +44,7 @@ docker compose up -d
 
 ## Файлы и хранилище
 
-- Куки складывайте в `./yakachokbot/cookies.txt`.
+- Куки складывайте в `./yakachokbot/cookies.txt` или отправляйте в чат боту файл(ы) `cookies.txt` — бот объединит их в один список (полезно для разных площадок).
 - В `./yakachokbot` также хранится `saved-translations.json`, если включены авто‑переводы.
 
 ## Как получить cookies.txt
