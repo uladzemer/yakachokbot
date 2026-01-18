@@ -252,6 +252,7 @@ const getFlatPlaylistEntries = async (
 	signal?: AbortSignal,
 ) => {
 	try {
+		const normalizedPlaylistUrl = url.replace(/\/+$/, "")
 		const { stdout } = await execFilePromise(
 			"yt-dlp",
 			[
@@ -272,9 +273,14 @@ const getFlatPlaylistEntries = async (
 			try {
 				const data = JSON.parse(line)
 				if (data?._type === "playlist") continue
-				const entryUrl = data?.webpage_url || data?.url
-				if (!entryUrl) continue
-				const normalized = String(entryUrl).trim()
+				const rawUrl =
+					typeof data?.url === "string" && /^https?:\/\//i.test(data.url)
+						? data.url
+						: data?.webpage_url
+				if (!rawUrl) continue
+				const normalized = String(rawUrl).trim()
+				const normalizedEntry = normalized.replace(/\/+$/, "")
+				if (normalizedEntry === normalizedPlaylistUrl) continue
 				if (!normalized || seen.has(normalized)) continue
 				seen.add(normalized)
 				entries.push({ url: normalized, title: data?.title })
