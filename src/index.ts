@@ -916,6 +916,110 @@ const buildFormatFilenameLabel = (format: any) => {
 	return label
 }
 
+const estimateFormatSize = (format: any, duration?: number) => {
+	if (typeof format?.filesize === "number" && format.filesize > 0) {
+		return format.filesize
+	}
+	if (typeof format?.filesize_approx === "number" && format.filesize_approx > 0) {
+		return format.filesize_approx
+	}
+	if (typeof duration === "number" && Number.isFinite(duration) && duration > 0) {
+		const tbr =
+			typeof format?.tbr === "number"
+				? format.tbr
+				: typeof format?.vbr === "number"
+					? format.vbr
+					: typeof format?.abr === "number"
+						? format.abr
+						: undefined
+		if (typeof tbr === "number" && Number.isFinite(tbr) && tbr > 0) {
+			return Math.round((tbr * 1000 * duration) / 8)
+		}
+	}
+	return undefined
+}
+
+const getFormatSuggestionLabel = (
+	entry: FormatEntry,
+	sizeBytes?: number,
+) => {
+	const f = entry.format
+	const { codecLabel, bitrate, isDash, isHls } = entry.meta
+	const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "")
+	const sizeLabel = sizeBytes ? formatBytes(sizeBytes) : ""
+	let label = f.format_id || "format"
+	if (res) {
+		label += ` ${res}`
+	}
+	if (isHls) label += " hls"
+	if (isDash) label += " dash"
+	if (codecLabel) label += ` ${codecLabel}`
+	if (bitrate) label += ` ${bitrate}`
+	if (sizeLabel) label += ` (${sizeLabel})`
+	return label
+}
+
+const pickBestFormatUnderLimit = (
+	formats: any[],
+	duration: number | undefined,
+	maxBytes: number,
+) => {
+	const entries = formats.map((format) => ({
+		format,
+		meta: getFormatMeta(format),
+	}))
+	const candidates = entries
+		.map((entry) => ({
+			entry,
+			size: estimateFormatSize(entry.format, duration),
+		}))
+		.filter((item) => typeof item.size === "number" && item.size <= maxBytes)
+
+	if (candidates.length === 0) return undefined
+
+	const scored = candidates.map((item) => {
+		const { entry, size } = item
+		const resScore = Number(entry.format?.height || 0)
+		const hasAudio = entry.meta.hasAudio
+		const hasVideo = entry.meta.hasVideo
+		const score =
+			(hasVideo ? 1000 : 0) +
+			(hasAudio ? 500 : 0) +
+			(entry.meta.isHls ? 200 : 0) +
+			resScore +
+			Math.round((size || 0) / (1024 * 1024))
+		return { entry, size, score }
+	})
+
+	scored.sort((a, b) => b.score - a.score)
+	return scored[0]
+}
+
+const buildFormatSuggestions = (
+	formats: any[],
+	duration: number | undefined,
+	maxBytes: number,
+	limit = 3,
+) => {
+	const entries = formats.map((format) => ({
+		format,
+		meta: getFormatMeta(format),
+	}))
+	const candidates = entries
+		.map((entry) => ({
+			entry,
+			size: estimateFormatSize(entry.format, duration),
+		}))
+		.filter((item) => typeof item.size === "number" && item.size <= maxBytes)
+		.sort((a, b) => (b.size || 0) - (a.size || 0))
+
+	return candidates.slice(0, limit).map((item) => ({
+		entry: item.entry,
+		size: item.size,
+		label: getFormatSuggestionLabel(item.entry, item.size),
+	}))
+}
+
 const sanitizeFilePart = (value: string, fallback: string) => {
 	const cleaned = value
 		.trim()
@@ -1162,6 +1266,10 @@ const downloadAndSend = async (
 	let tempFilePath = resolve(tempDir, "video.mp4")
 	const tempThumbPath = resolve(tempDir, "thumb.jpg")
 	const threadId = ctx.message?.message_thread_id || ctx.callbackQuery?.message?.message_thread_id
+	let selectedQuality = quality
+	let selectedIsRawFormat = isRawFormat
+	let selectedForceHls = forceHls
+	let selectedFormatLabelTail = formatLabelTail
 	
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
@@ -1169,15 +1277,16 @@ const downloadAndSend = async (
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const isErome = urlMatcher(url, "erome.com")
 		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
-		const forceHlsDownload = forceHls || isDirectHls
+		let forceHlsDownload = selectedForceHls || isDirectHls
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const resumeArgs = isErome ? ["--no-continue"] : []
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 
-		const isMp3Format = isRawFormat && quality === "mp3"
-		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
+		let isMp3Format = selectedIsRawFormat && selectedQuality === "mp3"
+		let isAudioRequest =
+			selectedQuality === "audio" || isMp3Format || forceAudio
 
 		if (isErome && !skipPlaylist) {
 			const entries = await getFlatPlaylistEntries(
@@ -1290,17 +1399,17 @@ const downloadAndSend = async (
 
 		let formatArgs: string[] = []
 		let fallbackFormatArgs: string[] | undefined
-		if (isRawFormat) {
+		if (selectedIsRawFormat) {
 			if (isMp3Format) {
 				formatArgs = ["-f", "251", "-x", "--audio-format", "mp3"]
 			} else {
-				formatArgs = ["-f", quality]
+				formatArgs = ["-f", selectedQuality]
 			}
-		} else if (quality === "audio") {
+		} else if (selectedQuality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
 		} else if (isDirectHls) {
 			formatArgs = ["-f", "best"]
-		} else if (quality === "b") {
+		} else if (selectedQuality === "b") {
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
@@ -1322,21 +1431,23 @@ const downloadAndSend = async (
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
-					`bestvideo[protocol=https][height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${quality}][ext=mp4]/best[protocol=https][height<=${quality}]`,
+					`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
 				]
 				fallbackFormatArgs = [
 					"-f",
-					`best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
 				]
 			} else {
 				formatArgs = [
 					"-f",
-					`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+					`bestvideo[height<=${selectedQuality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
 				]
 			}
 		}
 
-		console.log(`[QUEUE] Starting download: ${url} (Quality: ${quality}) in chat ${ctx.chat.id}`)
+		console.log(
+			`[QUEUE] Starting download: ${url} (Quality: ${selectedQuality}) in chat ${ctx.chat.id}`,
+		)
 
 		if (statusMessageId) {
 			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
@@ -1372,9 +1483,13 @@ const downloadAndSend = async (
 		const title = overrideTitle || resolvedTitle
 		const captionUrl = sourceUrl || url
 		const caption = link(title || "Video", cleanUrl(captionUrl))
+		const infoDuration =
+			typeof info.duration === "number" && Number.isFinite(info.duration)
+				? info.duration
+				: undefined
 		const safeTitle = sanitizeFilePart(title || "video", "video")
-		const formatTail = formatLabelTail
-			? sanitizeFilePart(formatLabelTail, "")
+		const formatTail = selectedFormatLabelTail
+			? sanitizeFilePart(selectedFormatLabelTail, "")
 			: ""
 		const dashFileBase = formatTail ? `${safeTitle}_${formatTail}` : ""
 		const maxUploadSize = 2 * 1024 * 1024 * 1024
@@ -1402,23 +1517,131 @@ const downloadAndSend = async (
 		const estimatedSize = sizeCandidates.length
 			? Math.max(...sizeCandidates)
 			: 0
-		const estimatedSizeLabel = estimatedSize ? formatBytes(estimatedSize) : ""
-		if (estimatedSize >= maxUploadSize) {
-			const limitMessage = "Можно загрузить файлы до 2ГБ"
-			if (statusMessageId) {
-				await updateMessage(ctx, statusMessageId, limitMessage)
-			} else if (ctx.callbackQuery) {
-				await ctx.editMessageText(limitMessage)
-			} else {
-				await ctx.reply(limitMessage)
+		let estimatedSizeLabel = estimatedSize ? formatBytes(estimatedSize) : ""
+
+		let maxEstimatedFromFormats = 0
+		const formatsArray = Array.isArray(info.formats) ? info.formats : []
+		for (const format of formatsArray) {
+			const size = estimateFormatSize(format, infoDuration)
+			if (typeof size === "number" && size > maxEstimatedFromFormats) {
+				maxEstimatedFromFormats = size
 			}
-			return
 		}
 
-		const requestedFormats = Array.isArray(info.requested_formats)
+		if (estimatedSize >= maxUploadSize || maxEstimatedFromFormats >= maxUploadSize) {
+			const suggestions = buildFormatSuggestions(
+				formatsArray,
+				infoDuration,
+				maxUploadSize,
+			)
+			const bestAlt = pickBestFormatUnderLimit(
+				formatsArray,
+				infoDuration,
+				maxUploadSize,
+			)
+			if (bestAlt) {
+				const altLabel = getFormatSuggestionLabel(bestAlt.entry, bestAlt.size)
+				selectedQuality = `${bestAlt.entry.format.format_id}`
+				selectedIsRawFormat = true
+				selectedForceHls = bestAlt.entry.meta.isHls
+				selectedFormatLabelTail = altLabel
+				if (typeof bestAlt.size === "number") {
+					estimatedSizeLabel = formatBytes(bestAlt.size)
+				}
+				const suggestionText = suggestions.length
+					? `\nДругие варианты ≤2ГБ:\n${suggestions.map((s) => `• ${s.label}`).join("\n")}`
+					: ""
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Файл слишком большой для Telegram (${formatBytes(maxUploadSize)}). Берём вариант: ${altLabel}${suggestionText}`,
+					)
+				} else if (ctx.callbackQuery) {
+					await ctx.editMessageText(
+						`Файл слишком большой для Telegram (${formatBytes(maxUploadSize)}). Берём вариант: ${altLabel}${suggestionText}`,
+					)
+				}
+			} else {
+				const suggestionText = suggestions.length
+					? `\nДоступные варианты ≤2ГБ:\n${suggestions.map((s) => `• ${s.label}`).join("\n")}`
+					: ""
+				const limitMessage =
+					"Можно загрузить файлы до 2ГБ." +
+					suggestionText +
+					"\nИспользуйте /formats для выбора."
+				if (statusMessageId) {
+					await updateMessage(ctx, statusMessageId, limitMessage)
+				} else if (ctx.callbackQuery) {
+					await ctx.editMessageText(limitMessage)
+				} else {
+					await ctx.reply(limitMessage)
+				}
+				return
+			}
+		}
+
+		forceHlsDownload = selectedForceHls || isDirectHls
+		isMp3Format = selectedIsRawFormat && selectedQuality === "mp3"
+		isAudioRequest = selectedQuality === "audio" || isMp3Format || forceAudio
+		formatArgs = []
+		fallbackFormatArgs = undefined
+		if (selectedIsRawFormat) {
+			if (isMp3Format) {
+				formatArgs = ["-f", "251", "-x", "--audio-format", "mp3"]
+			} else {
+				formatArgs = ["-f", selectedQuality]
+			}
+		} else if (selectedQuality === "audio") {
+			formatArgs = ["-x", "--audio-format", "mp3"]
+		} else if (isDirectHls) {
+			formatArgs = ["-f", "best"]
+		} else if (selectedQuality === "b") {
+			if (isYouTube) {
+				formatArgs = [
+					"-f",
+					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+				]
+				fallbackFormatArgs = [
+					"-f",
+					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+			} else if (isErome) {
+				formatArgs = ["-f", "best[ext=mp4]/best"]
+			} else {
+				formatArgs = [
+					"-f",
+					"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+			}
+		} else {
+			if (isYouTube) {
+				formatArgs = [
+					"-f",
+					`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
+				]
+				fallbackFormatArgs = [
+					"-f",
+					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+				]
+			} else {
+				formatArgs = [
+					"-f",
+					`bestvideo[height<=${selectedQuality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+				]
+			}
+		}
+
+		let requestedFormats = Array.isArray(info.requested_formats)
 			? info.requested_formats
 			: []
-		const isCombined = isRawFormat && requestedFormats.length > 1
+		const selectedFormat = formatsArray.find(
+			(format) => `${format?.format_id}` === selectedQuality,
+		)
+		if (selectedIsRawFormat && selectedFormat) {
+			requestedFormats = [selectedFormat]
+		}
+		const isCombined = selectedIsRawFormat && requestedFormats.length > 1
 		let outputContainer: "mp4" | "webm" | "mkv" | "mhtml" = "mp4"
 		let audioTranscodeCodec: "aac" | "opus" | null = null
 		let audioTranscodeBitrate = "256k"
