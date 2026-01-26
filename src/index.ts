@@ -449,6 +449,28 @@ const resolveXfree = async (url: string) => {
 	}
 }
 
+const pinterestMatcher = (url: string) => {
+	try {
+		return urlMatcher(url, "pinterest.com") || urlMatcher(url, "pin.it")
+	} catch {
+		return false
+	}
+}
+
+const resolvePinterest = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/pinterest_bypass.py",
+			url,
+			COOKIE_FILE,
+		])
+		return JSON.parse(stdout)
+	} catch (e) {
+		console.error("Pinterest resolve error", e)
+		return { error: "Failed to run bypass script" }
+	}
+}
+
 const threadsMatcher = (url: string) =>
 	url.includes("threads.com") || url.includes("threads.net")
 
@@ -1146,11 +1168,16 @@ const downloadAndSend = async (
 		const isInstagram =
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const isErome = urlMatcher(url, "erome.com")
+		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
+		const forceHlsDownload = forceHls || isDirectHls
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const resumeArgs = isErome ? ["--no-continue"] : []
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+
+		const isMp3Format = isRawFormat && quality === "mp3"
+		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
 
 		if (isErome && !skipPlaylist) {
 			const entries = await getFlatPlaylistEntries(
@@ -1197,8 +1224,70 @@ const downloadAndSend = async (
 			}
 		}
 
-		const isMp3Format = isRawFormat && quality === "mp3"
-		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
+		if (isDirectHls && !isAudioRequest) {
+			const title = overrideTitle || "Video"
+			const captionUrl = sourceUrl || url
+			const caption = link(title, cleanUrl(captionUrl))
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Обработка: <b>${title}</b>\nСтатус: Скачиваем...`,
+				)
+			}
+			const ffmpegArgs = [
+				"-y",
+				"-user_agent",
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				"-headers",
+				`Referer: ${captionUrl}\r\n`,
+				"-i",
+				url,
+				"-c",
+				"copy",
+				"-bsf:a",
+				"aac_adtstoasc",
+				"-movflags",
+				"+faststart",
+				tempFilePath,
+			]
+			await spawnPromise("ffmpeg", ffmpegArgs, undefined, signal)
+			const metadata = await getVideoMetadata(tempFilePath)
+			await generateThumbnail(tempFilePath, tempThumbPath)
+			const thumbFile = (await fileExists(tempThumbPath, 256))
+				? new InputFile(tempThumbPath)
+				: undefined
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+				)
+			}
+			await ctx.replyWithChatAction("upload_video")
+			await ctx.replyWithVideo(new InputFile(tempFilePath), {
+				caption,
+				parse_mode: "HTML",
+				supports_streaming: true,
+				duration: metadata.duration,
+				width: metadata.width,
+				height: metadata.height,
+				thumbnail: thumbFile,
+				message_thread_id: threadId,
+			})
+			if (statusMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+				} catch {}
+			}
+			if (replyToMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, replyToMessageId)
+				} catch {}
+			}
+			return
+		}
+
 		let formatArgs: string[] = []
 		let fallbackFormatArgs: string[] | undefined
 		if (isRawFormat) {
@@ -1209,23 +1298,25 @@ const downloadAndSend = async (
 			}
 		} else if (quality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
-			} else if (quality === "b") {
-				if (isYouTube) {
-					formatArgs = [
-						"-f",
-						"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
-					]
-					fallbackFormatArgs = [
-						"-f",
-						"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-					]
-				} else if (isErome) {
-					formatArgs = ["-f", "best[ext=mp4]/best"]
-				} else {
-					formatArgs = [
-						"-f",
-						"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-					]
+		} else if (isDirectHls) {
+			formatArgs = ["-f", "best"]
+		} else if (quality === "b") {
+			if (isYouTube) {
+				formatArgs = [
+					"-f",
+					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+				]
+				fallbackFormatArgs = [
+					"-f",
+					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
+			} else if (isErome) {
+				formatArgs = ["-f", "best[ext=mp4]/best"]
+			} else {
+				formatArgs = [
+					"-f",
+					"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+				]
 			}
 		} else {
 			if (isYouTube) {
@@ -1253,7 +1344,8 @@ const downloadAndSend = async (
 
 		const skipJsRuntimeForInfo =
 			isYouTube &&
-			(forceHls || formatArgs.some((arg) => arg.includes("protocol*=m3u8")))
+			(forceHlsDownload ||
+				formatArgs.some((arg) => arg.includes("protocol*=m3u8")))
 		const fallbackSourceUrl = sourceUrl || url
 		const genericFallbacks = shouldTryGenericFallback(fallbackSourceUrl)
 			? buildGenericFallbacks(fallbackSourceUrl)
@@ -1344,7 +1436,7 @@ const downloadAndSend = async (
 			arg.includes("protocol*=m3u8"),
 		)
 		const isHlsDownload =
-			forceHls ||
+			forceHlsDownload ||
 			(!isMhtml &&
 				(hlsPreferredByFormatArgs ||
 					formatProtocol.includes("m3u8") ||
@@ -2249,6 +2341,27 @@ bot.on("message:text", async (ctx, next) => {
 					return
 				}
 			}
+			const isPinterest = pinterestMatcher(downloadUrl)
+			if (isPinterest) {
+				const pinterestData = await resolvePinterest(downloadUrl)
+				if (pinterestData.video_url) {
+					downloadUrl = pinterestData.video_url
+					bypassTitle = pinterestData.title
+				} else if (Array.isArray(pinterestData.photo_urls)) {
+					const caption = link(
+						pinterestData.title || "Pinterest",
+						cleanUrl(sourceUrl),
+					)
+					await sendPhotoUrls(
+						ctx,
+						pinterestData.photo_urls,
+						caption,
+						ctx.message?.message_thread_id,
+						ctx.message?.message_id,
+					)
+					return
+				}
+			}
 			const isYouTube = isYouTubeUrl(downloadUrl)
 			const cookieArgsList = await cookieArgs()
 			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
@@ -2393,17 +2506,16 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			}
 
 			if (resolved.status === "picker") {
-				const photos = chunkArray(
-					10,
-					resolved.picker
-						.filter((p) => p.type === "photo")
-						.map((p) => ({
-							type: "photo" as const,
-							media: p.url,
-						})),
-				)
+				const mediaItems = resolved.picker
+					.filter((p) => typeof p.url === "string" && p.url.length > 0)
+					.map((p) => ({
+						type: p.type === "photo" ? ("photo" as const) : ("video" as const),
+						media: p.url,
+						...(p.type === "photo" ? {} : { supports_streaming: true }),
+					}))
 
-				for (const chunk of photos) {
+				const groups = chunkArray(10, mediaItems)
+				for (const chunk of groups) {
 					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
 						reply_to_message_id: ctx.message.message_id,
 						message_thread_id: threadId,
@@ -2492,6 +2604,30 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				return
 			} else if (threadsData.error) {
 				console.error("Threads error:", threadsData.error)
+			}
+		}
+
+		const isPinterest = pinterestMatcher(url.text)
+		if (isPinterest) {
+			const pinterestData = await resolvePinterest(url.text)
+			if (pinterestData.video_url) {
+				url.text = pinterestData.video_url
+				bypassTitle = pinterestData.title
+			} else if (Array.isArray(pinterestData.photo_urls)) {
+				const caption = link(
+					pinterestData.title || "Pinterest",
+					cleanUrl(sourceUrl),
+				)
+				await sendPhotoUrls(
+					ctx,
+					pinterestData.photo_urls,
+					caption,
+					threadId,
+					ctx.message.message_id,
+				)
+				return
+			} else if (pinterestData.error) {
+				console.error("Pinterest error:", pinterestData.error)
 			}
 		}
 
