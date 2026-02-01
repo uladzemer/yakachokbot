@@ -35,6 +35,7 @@ services:
 
       # provide your cobalt instance url (optional, can be left as-is for the default compose.yml)
       COBALT_INSTANCE_URL: "http://cobalt:9000"
+      STORAGE_DIR: "/app/storage"
 
     depends_on:
       telegram-bot-api:

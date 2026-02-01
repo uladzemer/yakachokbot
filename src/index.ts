@@ -548,31 +548,15 @@ const loadUserLinks = async () => {
 			const id = Number.parseInt(key)
 			if (Number.isNaN(id)) continue
 			if (!Array.isArray(value)) continue
-			const deduped = new Map<string, LinkHistoryEntry>()
-			for (const entry of value) {
-				const current = deduped.get(entry.url)
-				if (!current) {
-					deduped.set(entry.url, entry)
-					continue
-				}
-				const currentIsFinal =
-					current.status === "success" || current.status === "error"
-				const entryIsFinal =
-					entry.status === "success" || entry.status === "error"
-				if (entryIsFinal && !currentIsFinal) {
-					deduped.set(entry.url, entry)
-					continue
-				}
-				if (entryIsFinal === currentIsFinal) {
-					if (Date.parse(entry.at) > Date.parse(current.at)) {
-						deduped.set(entry.url, entry)
-					}
-				}
-			}
-			const list = Array.from(deduped.values()).sort(
-				(a, b) => Date.parse(b.at) - Date.parse(a.at),
-			)
-			userLinks.set(id, list)
+			const list = value
+				.filter(
+					(entry) =>
+						typeof entry?.url === "string" &&
+						typeof entry?.status === "string" &&
+						typeof entry?.at === "string",
+				)
+				.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+			userLinks.set(id, list.slice(0, 200))
 		}
 	} catch {}
 }
@@ -787,34 +771,15 @@ const logUserLink = async (
 	await loadUserLinks()
 	const normalized = cleanUrl(url)
 	const list = userLinks.get(userId) ?? []
-	const existingIndex = list.findIndex((item) => item.url === normalized)
-	const existing = existingIndex >= 0 ? list[existingIndex] : undefined
-	const finalStatuses: LinkHistoryEntry["status"][] = ["success", "error"]
-	const isFinal = finalStatuses.includes(status)
-	if (existing) {
-		// Do not overwrite a final status with a non-final update.
-		if (!isFinal && finalStatuses.includes(existing.status)) {
-			return
-		}
-		const updated: LinkHistoryEntry = {
-			...existing,
-			status,
-			at: new Date().toISOString(),
-			error: error ? cutoffWithNotice(String(error)) : existing.error,
-		}
-		list.splice(existingIndex, 1)
-		list.unshift(updated)
-	} else {
-		const entry: LinkHistoryEntry = {
-			id: randomUUID(),
-			userId,
-			url: normalized,
-			status,
-			at: new Date().toISOString(),
-			error: error ? cutoffWithNotice(String(error)) : undefined,
-		}
-		list.unshift(entry)
+	const entry: LinkHistoryEntry = {
+		id: randomUUID(),
+		userId,
+		url: normalized,
+		status,
+		at: new Date().toISOString(),
+		error: error ? cutoffWithNotice(String(error)) : undefined,
 	}
+	list.unshift(entry)
 	if (list.length > 200) list.length = 200
 	userLinks.set(userId, list)
 	scheduleUserLinksSave()
@@ -1179,6 +1144,49 @@ const shouldTryGenericFallback = (url: string) => {
 		return false
 	if (threadsMatcher(url) || soraMatcher(url) || xfreeMatcher(url)) return false
 	return true
+}
+
+const isInstagramUrl = (url: string) =>
+	urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
+
+const fetchInstagramAuthor = async (url: string) => {
+	const clean = cleanUrl(url)
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 4000)
+	try {
+		const res = await fetch(
+			`https://www.instagram.com/oembed/?url=${encodeURIComponent(clean)}`,
+			{ signal: controller.signal },
+		)
+		if (!res.ok) return undefined
+		const data = (await res.json()) as {
+			author_name?: string
+			author_url?: string
+		}
+		const name =
+			typeof data?.author_name === "string" ? data.author_name.trim() : ""
+		const authorUrl =
+			typeof data?.author_url === "string" ? data.author_url.trim() : ""
+		if (!name) return undefined
+		return { name, url: authorUrl || undefined }
+	} catch {
+		return undefined
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
+const buildInstagramCaption = async (url: string) => {
+	const clean = cleanUrl(url)
+	const author = await fetchInstagramAuthor(clean)
+	if (author?.name) {
+		const safeName = escapeHtml(author.name)
+		const authorLine = author.url
+			? `Автор: ${link(safeName, author.url)}`
+			: `Автор: ${safeName}`
+		return `${authorLine}\n${link("Источник", clean)}`
+	}
+	return `Источник: ${link("Instagram", clean)}`
 }
 
 const sendPhotoUrls = async (
@@ -5566,20 +5574,34 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			}
 
 			if (resolved.status === "picker") {
+				let caption: string | undefined
+				if (isInstagramUrl(url.text)) {
+					caption = await buildInstagramCaption(url.text)
+				}
 				const mediaItems = resolved.picker
 					.filter((p) => typeof p.url === "string" && p.url.length > 0)
-					.map((p) => ({
+					.map((p, index) => ({
 						type: p.type === "photo" ? ("photo" as const) : ("video" as const),
 						media: p.url,
+						caption: index === 0 ? caption : undefined,
+						parse_mode: index === 0 && caption ? "HTML" : undefined,
 						...(p.type === "photo" ? {} : { supports_streaming: true }),
 					}))
 
 				const groups = chunkArray(10, mediaItems)
+				let firstGroup = true
 				for (const chunk of groups) {
+					if (!firstGroup) {
+						for (const item of chunk) {
+							item.caption = undefined
+							item.parse_mode = undefined
+						}
+					}
 					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
 						reply_to_message_id: ctx.message.message_id,
 						message_thread_id: threadId,
 					})
+					firstGroup = false
 				}
 
 				await logUserLink(userId, sourceUrl, "success")
@@ -5587,10 +5609,12 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			}
 
 			if (resolved.status === "redirect" || resolved.status === "tunnel") {
-				const caption = link(
-					"Instagram", // Default title if Cobalt doesn't provide one
-					cleanUrl(url.text),
-				)
+				const caption = isInstagramUrl(url.text)
+					? await buildInstagramCaption(url.text)
+					: link(
+							"Instagram", // Default title if Cobalt doesn't provide one
+							cleanUrl(url.text),
+						)
 				const response = await fetch(resolved.url)
 				const buffer = await response.arrayBuffer()
 				const inputFile = new InputFile(new Uint8Array(buffer), resolved.filename)
