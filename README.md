@@ -3,7 +3,6 @@
 Телеграм-бот для быстрой загрузки видео и аудио с разных сайтов через yt-dlp.
 
 [![Telegram Bot](https://img.shields.io/badge/TELEGRAM-BOT-%2330A3E6?style=for-the-badge&logo=telegram)](https://t.me/yakachokbot)
-![GitHub top language](https://img.shields.io/github/languages/top/uladzemer/yakachokbot?style=for-the-badge)
 
 ## Возможности
 

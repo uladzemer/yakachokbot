@@ -66,7 +66,7 @@ export const t = {
 		bold("This bot is private."),
 		"",
 		"It costs money to run this and unfortunately it doesn't grow on trees.",
-		`This bot is open source, so you can always ${link("host it yourself", "https://github.com/uladzemer/yakachokbot#hosting")}.`,
+		"This bot is open source, so you can always host it yourself.",
 		"",
 		bold(
 			`As an alternative I recommend checking out ${link(
