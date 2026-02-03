@@ -23,6 +23,7 @@ RUN corepack enable && corepack prepare pnpm@10 --activate
 RUN pnpm install --frozen-lockfile
 
 COPY src ./src
+COPY vendor ./vendor
 
 EXPOSE ${TELEGRAM_WEBHOOK_PORT}
 

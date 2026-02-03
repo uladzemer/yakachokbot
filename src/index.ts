@@ -13,6 +13,8 @@ import os from "node:os"
 import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
 import type { NextFunction, Request, Response } from "express"
+import VOTClient from "../vendor/node_modules/@vot.js/node/dist/client.js"
+import { getVideoData } from "../vendor/node_modules/@vot.js/node/dist/utils/videoData.js"
 import { cookieFormatExample, mergeCookieContent } from "./cookies"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
@@ -40,6 +42,9 @@ import {
 	USERS_FILE,
 	YTDL_PROXY,
 	WHITELISTED_IDS,
+	VOT_REQUEST_LANG,
+	VOT_RESPONSE_LANG,
+	VOT_MAX_WAIT_SECONDS,
 } from "./environment"
 import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
 import { Queue } from "./queue"
@@ -1040,11 +1045,13 @@ const parseHmsToSeconds = (value: string) => {
 const trimTrailingUrlPunctuation = (value: string) =>
 	value.replace(/[)\].,!?:;]+$/g, "")
 
-const extractMessageUrls = (ctx: any) => {
-	const text = ctx.message?.text || ""
-	const entities = Array.isArray(ctx.message?.entities)
-		? ctx.message.entities
-		: []
+const extractUrlsFromMessage = (message: any) => {
+	const text = message?.text || message?.caption || ""
+	const entities = Array.isArray(message?.entities)
+		? message.entities
+		: Array.isArray(message?.caption_entities)
+			? message.caption_entities
+			: []
 	const urls: string[] = []
 	for (const entity of entities) {
 		if (
@@ -1065,6 +1072,8 @@ const extractMessageUrls = (ctx: any) => {
 	}
 	return urls.map(trimTrailingUrlPunctuation).filter(Boolean)
 }
+
+const extractMessageUrls = (ctx: any) => extractUrlsFromMessage(ctx.message)
 
 const isYouTubeUrl = (url: string) => {
 	try {
@@ -1091,6 +1100,97 @@ const isYandexVtransUrl = (url: string) => {
 		)
 	} catch {
 		return false
+	}
+}
+
+const getVotClient = (() => {
+	let client: VOTClient | null = null
+	return () => {
+		if (!client) client = new VOTClient()
+		return client
+	}
+})()
+
+const pickVotAudioUrl = (response: any) => {
+	const candidates = [
+		response?.result?.url,
+		response?.result?.audioUrl,
+		response?.result?.audio_url,
+		response?.url,
+		response?.audioUrl,
+		response?.audio_url,
+	]
+	for (const candidate of candidates) {
+		if (typeof candidate === "string" && candidate.startsWith("http")) {
+			return candidate
+		}
+	}
+	if (Array.isArray(response?.result?.urls)) {
+		const urlCandidate = response.result.urls.find(
+			(item: any) => typeof item === "string" && item.startsWith("http"),
+		)
+		if (urlCandidate) return urlCandidate
+	}
+	if (Array.isArray(response?.result)) {
+		for (const item of response.result) {
+			if (typeof item?.url === "string" && item.url.startsWith("http")) {
+				return item.url
+			}
+		}
+	}
+	return undefined
+}
+
+const translateWithVot = async (
+	url: string,
+	ctx: any,
+	statusMessageId?: number,
+	signal?: AbortSignal,
+) => {
+	const client = getVotClient()
+	const videoData = await getVideoData(url)
+	const maxWaitSeconds =
+		Number.isFinite(VOT_MAX_WAIT_SECONDS) && VOT_MAX_WAIT_SECONDS > 0
+			? VOT_MAX_WAIT_SECONDS
+			: 300
+	let waitedSeconds = 0
+	while (true) {
+		if (signal?.aborted) throw new Error("Cancelled")
+		const response = await client.translateVideo({
+			videoData,
+			requestLang: VOT_REQUEST_LANG,
+			responseLang: VOT_RESPONSE_LANG,
+			shouldSendFailedAudio: true,
+		})
+		const audioUrl = pickVotAudioUrl(response)
+		if (audioUrl) return audioUrl
+		if (response?.translated === false) {
+			const remainingRaw = Number(
+				response?.remainingTime ?? response?.remaining_time,
+			)
+			const intervalSeconds = Number.isFinite(remainingRaw) && remainingRaw > 0
+				? Math.min(remainingRaw, 60)
+				: 10
+			waitedSeconds += intervalSeconds
+			if (waitedSeconds > maxWaitSeconds) {
+				throw new Error("Translation timed out")
+			}
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Перевод готовится, ждём ${intervalSeconds}с...`,
+				)
+			}
+			await sleepMs(intervalSeconds * 1000)
+			continue
+		}
+		const message =
+			typeof response?.message === "string" && response.message.trim()
+				? response.message
+				: undefined
+		if (message) throw new Error(message)
+		throw new Error("Перевод недоступен")
 	}
 }
 
@@ -3853,6 +3953,56 @@ const downloadAndSend = async (
 	}
 }
 
+const runTranslatedDownload = async (params: {
+	ctx: any
+	url: string
+	sourceUrl?: string
+	statusMessageId?: number
+	replyToMessageId?: number
+	signal?: AbortSignal
+	overrideTitle?: string
+	externalAudioUrl?: string
+}) => {
+	const {
+		ctx,
+		url,
+		sourceUrl,
+		statusMessageId,
+		replyToMessageId,
+		signal,
+		overrideTitle,
+		externalAudioUrl,
+	} = params
+	const translateTarget = sourceUrl || url
+	let audioUrl = externalAudioUrl
+	if (!audioUrl) {
+		if (statusMessageId) {
+			await updateMessage(
+				ctx,
+				statusMessageId,
+				`Запрашиваем перевод...`,
+			)
+		}
+		audioUrl = await translateWithVot(translateTarget, ctx, statusMessageId, signal)
+	}
+	await downloadAndSend(
+		ctx,
+		url,
+		"b",
+		false,
+		statusMessageId,
+		overrideTitle,
+		replyToMessageId,
+		signal,
+		false,
+		undefined,
+		false,
+		sourceUrl,
+		false,
+		audioUrl,
+	)
+}
+
 bot.use(async (ctx, next) => {
 	const from = ctx.from
 	if (from?.id) {
@@ -6069,6 +6219,71 @@ bot.command("formats", async (ctx) => {
 	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
 })
 
+bot.command("translate", async (ctx) => {
+	await deleteUserMessage(ctx)
+	const userId = ctx.from?.id
+	if (!userId) return
+	let urls = extractUrlsFromMessage(ctx.message)
+	if (urls.length === 0 && ctx.message?.reply_to_message) {
+		urls = extractUrlsFromMessage(ctx.message.reply_to_message)
+	}
+	const externalAudioUrl = urls.find(isYandexVtransUrl)
+	const rawUrl = urls.find((item) => !isYandexVtransUrl(item))
+	if (!rawUrl) {
+		await ctx.reply("Пришлите ссылку на видео для перевода.")
+		return
+	}
+	const sourceUrl = normalizeVimeoUrl(rawUrl)
+	void logUserLink(userId, sourceUrl, "requested")
+
+	const lockResult = lockUserUrl(userId, sourceUrl)
+	if (!lockResult.ok) {
+		await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.")
+		return
+	}
+	void incrementUserCounter(userId, "requests")
+	const lockId = lockResult.lockId
+	const processing = await ctx.reply("Ставим перевод в очередь...")
+	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
+		try {
+			await runTranslatedDownload({
+				ctx,
+				url: sourceUrl,
+				sourceUrl,
+				statusMessageId: processing.message_id,
+				replyToMessageId: ctx.message?.message_id,
+				signal,
+				externalAudioUrl,
+			})
+		} catch (error) {
+			console.error("Translate error:", error)
+			await logErrorEntry({
+				userId,
+				url: sourceUrl,
+				context: "translate",
+				error: error instanceof Error ? error.message : String(error),
+			})
+			if (processing?.message_id) {
+				await updateMessage(ctx, processing.message_id, "Ошибка перевода.")
+			}
+			if (ctx.chat?.type === "private") {
+				await createUserReportPrompt(
+					ctx,
+					`URL: ${cleanUrl(sourceUrl)}`,
+					error instanceof Error ? error.message : "Translation error",
+				)
+			}
+			await notifyAdminError(
+				ctx.chat,
+				`URL: ${cleanUrl(sourceUrl)}`,
+				error instanceof Error ? error.message : "Translation error",
+				ctx.from,
+				ctx.message,
+			)
+		}
+	})
+})
+
 bot.command("cancel", async (ctx) => {
 	await deleteUserMessage(ctx)
 	const userId = ctx.from?.id
@@ -6725,6 +6940,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		if (availableHeights.has(480))
 			keyboard.text("480p", `d:${requestId}:480`).row()
 
+		keyboard.text("Translate (Yandex)", `tv:${requestId}`).row()
 		keyboard.text("Audio (MP3)", `d:${requestId}:audio`).row()
 		keyboard.text("Cancel", `d:${requestId}:cancel`)
 
@@ -6881,6 +7097,84 @@ bot.on("callback_query:data", async (ctx) => {
 			await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() })
 		} catch {}
 		return await ctx.answerCallbackQuery({ text: "Отправлено" })
+	}
+	if (data.startsWith("tv:")) {
+		const [, requestId] = data.split(":")
+		if (!requestId) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid request.",
+				show_alert: true,
+			})
+		}
+		const cached = requestCache.get(requestId)
+		if (!cached) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return await ctx.deleteMessage()
+		}
+		const userId = ctx.from?.id
+		if (!userId) return
+		const blockReason = getQueueBlockReason(
+			userId,
+			getCacheLockUrl(cached),
+			cached.lockId,
+		)
+		if (blockReason) {
+			await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
+			return
+		}
+		if (!cached.lockId) {
+			await ctx.answerCallbackQuery({
+				text: "Request expired or invalid.",
+				show_alert: true,
+			})
+			return
+		}
+		requestCache.delete(requestId)
+		await deletePreviousMenuMessage(ctx)
+		const processing = await ctx.reply("Ставим перевод в очередь...")
+		enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
+			try {
+				await runTranslatedDownload({
+					ctx,
+					url: cached.url,
+					sourceUrl: cached.sourceUrl,
+					statusMessageId: processing.message_id,
+					replyToMessageId: ctx.callbackQuery.message?.message_id,
+					signal,
+					overrideTitle: cached.title,
+					externalAudioUrl: cached.externalAudioUrl,
+				})
+			} catch (error) {
+				console.error("Translate callback error:", error)
+				await logErrorEntry({
+					userId,
+					url: cached.sourceUrl || cached.url,
+					context: "translate",
+					error: error instanceof Error ? error.message : String(error),
+				})
+				if (processing?.message_id) {
+					await updateMessage(ctx, processing.message_id, "Ошибка перевода.")
+				}
+				if (ctx.chat?.type === "private") {
+					await createUserReportPrompt(
+						ctx,
+						`URL: ${cleanUrl(cached.sourceUrl || cached.url)}`,
+						error instanceof Error ? error.message : "Translation error",
+					)
+				}
+				await notifyAdminError(
+					ctx.chat,
+					`URL: ${cleanUrl(cached.sourceUrl || cached.url)}`,
+					error instanceof Error ? error.message : "Translation error",
+					ctx.from,
+					ctx.message,
+				)
+			}
+		})
+		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
 	}
 	if (data.startsWith("f:")) {
 		const [, requestId, listType] = data.split(":")

@@ -21,6 +21,8 @@ yakachokbot/cookies.txt
 
 # Dependencies
 node_modules/
+!vendor/node_modules/
+!vendor/node_modules/**
 
 # Build outputs
 lib/

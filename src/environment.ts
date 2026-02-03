@@ -35,6 +35,11 @@ export const ADMIN_ONLY = getVariable("ADMIN_ONLY", "false") === "true"
 export const ADMIN_DASHBOARD_USER = getVariable("ADMIN_DASHBOARD_USER", "")
 export const ADMIN_DASHBOARD_PASSWORD = getVariable("ADMIN_DASHBOARD_PASSWORD", "")
 export const ALWAYS_DOWNLOAD_BEST = getVariable("ALWAYS_DOWNLOAD_BEST", "false") !== "false"
+export const VOT_REQUEST_LANG = getVariable("VOT_REQUEST_LANG", "auto")
+export const VOT_RESPONSE_LANG = getVariable("VOT_RESPONSE_LANG", "ru")
+export const VOT_MAX_WAIT_SECONDS = Number.parseInt(
+	getVariable("VOT_MAX_WAIT_SECONDS", "300"),
+)
 export const CLEANUP_INTERVAL_HOURS = Number.parseInt(
 	getVariable("CLEANUP_INTERVAL_HOURS", "6"),
 )
