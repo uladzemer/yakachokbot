@@ -1128,6 +1128,180 @@ const resolveThreads = async (url: string) => {
 	}
 }
 
+const behanceMatcher = (url: string) => {
+	try {
+		return urlMatcher(url, "behance.net")
+	} catch {
+		return false
+	}
+}
+
+const extractIframeSrc = (html: string) => {
+	const match = html.match(/<iframe[^>]+src="([^"]+)"/i)
+	if (!match) return undefined
+	return match[1]?.replace(/&amp;/g, "&").trim()
+}
+
+const resolveBehance = async (url: string) => {
+	const clean = cleanUrl(url)
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 8000)
+	try {
+		const res = await fetch(clean, {
+			signal: controller.signal,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				Accept: "text/html",
+			},
+		})
+		if (!res.ok) {
+			return { error: `HTTP ${res.status}` }
+		}
+		const html = await res.text()
+		const stateMatch = html.match(
+			/<script type="application\/json" id="beconfig-store_state">(.*?)<\/script>/s,
+		)
+		let title: string | undefined
+		if (stateMatch?.[1]) {
+			try {
+				const state = JSON.parse(stateMatch[1])
+				title =
+					typeof state?.project?.project?.name === "string"
+						? state.project.project.name
+						: undefined
+				const modules: any[] = Array.isArray(state?.project?.project?.modules)
+					? state.project.project.modules
+					: []
+				for (const module of modules) {
+					if (module?.__typename === "EmbedModule") {
+						const embedHtml =
+							String(module.fluidEmbed || module.originalEmbed || "")
+						const src = extractIframeSrc(embedHtml)
+						if (src) {
+							return { video_url: normalizeVimeoUrl(src), title }
+						}
+					}
+				}
+			} catch (e) {
+				console.error("Behance parse error", e)
+			}
+		}
+		const fallbackSrc = extractIframeSrc(html)
+		if (fallbackSrc) {
+			return { video_url: normalizeVimeoUrl(fallbackSrc), title }
+		}
+		return { error: "No embed found" }
+	} catch (e) {
+		console.error("Behance resolve error", e)
+		return { error: "Failed to fetch Behance page" }
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
+const ccvMatcher = (url: string) => {
+	try {
+		return (
+			urlMatcher(url, "ccv.adobe.io") ||
+			urlMatcher(url, "cdn-prod-ccv.adobe.com")
+		)
+	} catch {
+		return false
+	}
+}
+
+const extractCcvServerData = (html: string) => {
+	const marker = "window.ccv$serverData"
+	const startIndex = html.indexOf(marker)
+	if (startIndex < 0) return undefined
+	let inString = false
+	let escapeNext = false
+	let depth = 0
+	let jsonStart = -1
+	for (let i = startIndex; i < html.length; i += 1) {
+		const ch = html[i]
+		if (inString) {
+			if (escapeNext) {
+				escapeNext = false
+			} else if (ch === "\\\\") {
+				escapeNext = true
+			} else if (ch === "\"") {
+				inString = false
+			}
+			continue
+		}
+		if (ch === "\"") {
+			inString = true
+			continue
+		}
+		if (ch === "{") {
+			if (depth === 0) jsonStart = i
+			depth += 1
+			continue
+		}
+		if (ch === "}") {
+			if (depth > 0) depth -= 1
+			if (depth === 0 && jsonStart >= 0) {
+				const jsonText = html.slice(jsonStart, i + 1)
+				try {
+					return JSON.parse(jsonText)
+				} catch (e) {
+					console.error("CCV serverData parse error", e)
+					return undefined
+				}
+			}
+		}
+	}
+	return undefined
+}
+
+const extractHtmlSource = (html: string, type: "m3u8" | "mp4") => {
+	const ext = type === "m3u8" ? "m3u8" : "mp4"
+	const regex = new RegExp(`<source[^>]+src="([^"]+\\.${ext}[^"]*)"`, "i")
+	const match = html.match(regex)
+	if (!match?.[1]) return undefined
+	return match[1]?.replace(/&amp;/g, "&").trim()
+}
+
+const resolveCcv = async (url: string) => {
+	const clean = cleanUrl(url)
+	if (/\\.(m3u8|mp4)(\\?|$)/i.test(clean)) {
+		return { video_url: clean }
+	}
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 8000)
+	try {
+		const res = await fetch(clean, {
+			signal: controller.signal,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				Accept: "text/html",
+			},
+		})
+		if (!res.ok) {
+			return { error: `HTTP ${res.status}` }
+		}
+		const html = await res.text()
+		const data = extractCcvServerData(html)
+		const m3u8Url =
+			typeof data?.m3u8URL === "string" ? data.m3u8URL.trim() : undefined
+		const mp4Url =
+			typeof data?.mp4URL === "string" ? data.mp4URL.trim() : undefined
+		const sourceM3u8 = extractHtmlSource(html, "m3u8")
+		const sourceMp4 = extractHtmlSource(html, "mp4")
+		const videoUrl = m3u8Url || sourceM3u8 || mp4Url || sourceMp4
+		if (!videoUrl) return { error: "No video sources found" }
+		return { video_url: videoUrl }
+	} catch (e) {
+		console.error("CCV resolve error", e)
+		return { error: "Failed to fetch CCV embed" }
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
 type FallbackAttempt = {
 	label: string
 	args: string[]
@@ -5796,6 +5970,25 @@ bot.on("message:text", async (ctx, next) => {
 					return
 				}
 			}
+			const isBehance = behanceMatcher(downloadUrl)
+			if (isBehance) {
+				const behanceData = await resolveBehance(downloadUrl)
+				if (behanceData.video_url) {
+					downloadUrl = behanceData.video_url
+					bypassTitle = behanceData.title
+				} else if (behanceData.error) {
+					console.error("Behance error:", behanceData.error)
+				}
+			}
+			const isCcv = ccvMatcher(downloadUrl)
+			if (isCcv) {
+				const ccvData = await resolveCcv(downloadUrl)
+				if (ccvData.video_url) {
+					downloadUrl = ccvData.video_url
+				} else if (ccvData.error) {
+					console.error("CCV error:", ccvData.error)
+				}
+			}
 				const isYouTube = isYouTubeUrl(downloadUrl)
 				const cookieArgsList = await cookieArgs()
 				const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
@@ -6146,6 +6339,25 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				return
 			} else if (pinterestData.error) {
 				console.error("Pinterest error:", pinterestData.error)
+			}
+		}
+		const isBehance = behanceMatcher(url.text)
+		if (isBehance) {
+			const behanceData = await resolveBehance(url.text)
+			if (behanceData.video_url) {
+				url.text = behanceData.video_url
+				bypassTitle = behanceData.title
+			} else if (behanceData.error) {
+				console.error("Behance error:", behanceData.error)
+			}
+		}
+		const isCcv = ccvMatcher(url.text)
+		if (isCcv) {
+			const ccvData = await resolveCcv(url.text)
+			if (ccvData.video_url) {
+				url.text = ccvData.video_url
+			} else if (ccvData.error) {
+				console.error("CCV error:", ccvData.error)
 			}
 		}
 
