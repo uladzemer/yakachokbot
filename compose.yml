@@ -33,6 +33,14 @@ services:
 
       # provide your OpenAI API key to enable auto-translation (optional)
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      # set to use VOT worker (external service)
+      VOT_WORKER_HOST: "vot-worker.toil.cc"
+      VOT_WORKER_FALLBACK_SECONDS: "180"
+      VOT_STATUS_VERBOSE: "true"
+      # set to enable Yandex lively voice translation (requires OAuth token)
+      VOT_LIVELY_VOICE: "${VOT_LIVELY_VOICE}"
+      VOT_OAUTH_TOKEN: "${VOT_OAUTH_TOKEN}"
+      VOT_MAX_WAIT_SECONDS: "900"
 
       # provide your cobalt instance url (optional, can be left as-is for the default compose.yml)
       COBALT_INSTANCE_URL: "http://cobalt:9000"

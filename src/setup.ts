@@ -69,9 +69,15 @@ const defaultCommands = [
 	{ command: "cancel", description: "Отменить все задания" },
 ]
 
+const privateCommands = [
+	...defaultCommands,
+	{ command: "translate", description: "Перевести видео" },
+]
+
 const adminCommands = [
 	{ command: "formats", description: "Показать доступные форматы" },
 	{ command: "cancel", description: "Отменить все задания" },
+	{ command: "translate", description: "Перевести видео" },
 	{ command: "cookie", description: "Upload cookies info" },
 	{ command: "clear", description: "Clear cookies" },
 	{ command: "proxy", description: "Set proxy for yt-dlp" },
@@ -85,6 +91,9 @@ const adminCommands = [
 const setCommandsSafely = async () => {
 	try {
 		await bot.api.setMyCommands(defaultCommands)
+		await bot.api.setMyCommands(privateCommands, {
+			scope: { type: "all_private_chats" },
+		})
 	} catch (error) {
 		console.error("Failed to set bot commands:", error)
 	}

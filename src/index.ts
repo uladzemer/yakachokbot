@@ -13,7 +13,9 @@ import os from "node:os"
 import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
 import type { NextFunction, Request, Response } from "express"
-import VOTClient from "../vendor/node_modules/@vot.js/node/dist/client.js"
+import VOTClient, {
+	VOTWorkerClient,
+} from "../vendor/node_modules/@vot.js/node/dist/client.js"
 import { getVideoData } from "../vendor/node_modules/@vot.js/node/dist/utils/videoData.js"
 import { cookieFormatExample, mergeCookieContent } from "./cookies"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
@@ -44,6 +46,11 @@ import {
 	WHITELISTED_IDS,
 	VOT_REQUEST_LANG,
 	VOT_RESPONSE_LANG,
+	VOT_WORKER_HOST,
+	VOT_WORKER_FALLBACK_SECONDS,
+	VOT_STATUS_VERBOSE,
+	VOT_LIVELY_VOICE,
+	VOT_OAUTH_TOKEN,
 	VOT_MAX_WAIT_SECONDS,
 } from "./environment"
 import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
@@ -87,6 +94,36 @@ const notifyAdminLog = async (title: string, error: unknown) => {
 	} catch (notifyError) {
 		console.error("Failed to notify admin:", notifyError)
 	}
+}
+
+const redactUrl = (value: string) => {
+	try {
+		const parsed = new URL(value)
+		parsed.search = ""
+		parsed.hash = ""
+		return parsed.toString()
+	} catch {
+		return value
+	}
+}
+
+const logTranslate = (message: string, details?: Record<string, unknown>) => {
+	if (details && Object.keys(details).length > 0) {
+		console.log(`[TRANSLATE] ${message}`, details)
+	} else {
+		console.log(`[TRANSLATE] ${message}`)
+	}
+}
+
+const formatVerboseStatus = (
+	base: string,
+	details?: Record<string, unknown>,
+) => {
+	if (!VOT_STATUS_VERBOSE) return base
+	const timeValue =
+		details?.time ?? details?.elapsed ?? details?.total ?? undefined
+	if (!timeValue) return base
+	return `${base}\nВремя: ${timeValue}`
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -157,16 +194,47 @@ const execFilePromise = (
 
 const updateMessage = (() => {
 	const lastUpdates = new Map<number, number>()
+	const redirects = new Map<number, number>()
 	return async (ctx: any, messageId: number, text: string) => {
+		const resolvedId = redirects.get(messageId) ?? messageId
 		const now = Date.now()
-		const last = lastUpdates.get(messageId) || 0
+		const last = lastUpdates.get(resolvedId) || 0
 		if (now - last < 1500) return
-		lastUpdates.set(messageId, now)
+		lastUpdates.set(resolvedId, now)
 		try {
-			await ctx.api.editMessageText(ctx.chat.id, messageId, text, {
+			await ctx.api.editMessageText(ctx.chat.id, resolvedId, text, {
 				parse_mode: "HTML",
 			})
-		} catch {}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			if (VOT_STATUS_VERBOSE) {
+				console.warn("[WARN] Failed to edit status message", {
+					messageId,
+					resolvedId,
+					error: message,
+				})
+			}
+			if (/message is not modified/i.test(message)) return
+			if (
+				/message to edit not found|message can't be edited|message_id_invalid|bad request/i.test(
+					message,
+				)
+			) {
+				try {
+					const threadId =
+						ctx.message?.message_thread_id ||
+						ctx.callbackQuery?.message?.message_thread_id
+					const sent = await ctx.reply(text, {
+						message_thread_id: threadId,
+					})
+					if (sent?.message_id) {
+						redirects.set(messageId, sent.message_id)
+						redirects.set(sent.message_id, sent.message_id)
+						lastUpdates.set(sent.message_id, now)
+					}
+				} catch {}
+			}
+		}
 	}
 })()
 
@@ -1103,13 +1171,82 @@ const isYandexVtransUrl = (url: string) => {
 	}
 }
 
+type VotClientMode = "direct" | "worker"
+
 const getVotClient = (() => {
-	let client: VOTClient | null = null
-	return () => {
-		if (!client) client = new VOTClient()
-		return client
+	let direct: VOTClient | null = null
+	let worker: VOTWorkerClient | null = null
+	return (mode: VotClientMode) => {
+		if (mode === "worker") {
+			if (!worker) {
+				worker = new VOTWorkerClient({
+					host: VOT_WORKER_HOST,
+					apiToken: VOT_OAUTH_TOKEN || undefined,
+				})
+			}
+			return worker
+		}
+		if (!direct) {
+			direct = new VOTClient({
+				apiToken: VOT_OAUTH_TOKEN || undefined,
+			})
+		}
+		return direct
 	}
 })()
+
+const parseDurationSeconds = (value: unknown) => {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		if (value <= 0) return undefined
+		if (value > 1000 && value % 1000 === 0) {
+			return Math.max(1, Math.round(value / 1000))
+		}
+		return Math.max(1, Math.round(value))
+	}
+	if (typeof value !== "string") return undefined
+	const trimmed = value.trim()
+	if (!trimmed) return undefined
+	const hmsMatch = trimmed.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/)
+	if (hmsMatch) {
+		const parts = hmsMatch.slice(1).map((part) => Number.parseInt(part, 10))
+		if (parts.some((part) => Number.isNaN(part))) return undefined
+		if (parts.length === 3) {
+			const [hours, minutes, seconds] = parts
+			return Math.max(1, hours * 3600 + minutes * 60 + seconds)
+		}
+		const [minutes, seconds] = parts
+		return Math.max(1, minutes * 60 + seconds)
+	}
+	const numericMatch = trimmed.match(/(\d+)\s*(сек|sec|seconds|s|мин|min|minutes|m)?/i)
+	if (!numericMatch) return undefined
+	const amount = Number.parseInt(numericMatch[1], 10)
+	if (Number.isNaN(amount) || amount <= 0) return undefined
+	const unit = (numericMatch[2] || "").toLowerCase()
+	if (unit.startsWith("м") || unit.startsWith("min")) return amount * 60
+	return amount
+}
+
+const pickRetryDelaySeconds = (data: any) => {
+	const candidates = [
+		data?.remainingTime,
+		data?.remaining_time,
+		data?.retryAfter,
+		data?.retry_after,
+		data?.retryIn,
+		data?.retry_in,
+		data?.waitTime,
+		data?.wait_time,
+	]
+	for (const candidate of candidates) {
+		const parsed = parseDurationSeconds(candidate)
+		if (parsed) return parsed
+	}
+	if (typeof data?.message === "string") {
+		const parsed = parseDurationSeconds(data.message)
+		if (parsed) return parsed
+	}
+	return undefined
+}
 
 const pickVotAudioUrl = (response: any) => {
 	const candidates = [
@@ -1147,23 +1284,215 @@ const translateWithVot = async (
 	statusMessageId?: number,
 	signal?: AbortSignal,
 ) => {
-	const client = getVotClient()
+	let mode: VotClientMode = VOT_WORKER_HOST ? "worker" : "direct"
+	const startedAt = Date.now()
+	const livelyRequested = VOT_LIVELY_VOICE
+	let livelyEnabled = Boolean(VOT_LIVELY_VOICE && VOT_OAUTH_TOKEN)
+	const baseRequestLang = VOT_REQUEST_LANG
+	const preferEnglishForLively = livelyEnabled && baseRequestLang === "auto"
+	let requestLang = preferEnglishForLively ? "en" : baseRequestLang
+	let waitedSeconds = 0
+	let attempts = 0
+	const formatStatus = (base: string) =>
+		formatVerboseStatus(base, {
+			time: `${Math.round((Date.now() - startedAt) / 1000)}s`,
+		})
+	const waitWithCountdown = async (
+		makeText: (remaining: number) => string,
+		totalSeconds: number,
+	) => {
+		if (!statusMessageId || totalSeconds <= 0) {
+			if (totalSeconds > 0) {
+				await sleepMs(totalSeconds * 1000)
+			}
+			return
+		}
+		const step =
+			totalSeconds >= 30 ? 5 : totalSeconds >= 10 ? 2 : 1
+		let remaining = totalSeconds
+		while (remaining > 0) {
+			if (signal?.aborted) throw new Error("Cancelled")
+			await updateMessage(ctx, statusMessageId, formatStatus(makeText(remaining)))
+			const sleepFor = Math.min(step, remaining)
+			await sleepMs(sleepFor * 1000)
+			remaining -= sleepFor
+		}
+	}
+	const fallbackAfterSeconds =
+		Number.isFinite(VOT_WORKER_FALLBACK_SECONDS) && VOT_WORKER_FALLBACK_SECONDS > 0
+			? VOT_WORKER_FALLBACK_SECONDS
+			: 180
 	const videoData = await getVideoData(url)
+	logTranslate("start", {
+		mode,
+		url: redactUrl(url),
+		requestLang,
+		baseRequestLang,
+		responseLang: VOT_RESPONSE_LANG,
+		livelyRequested,
+		livelyEnabled,
+	})
+	if (preferEnglishForLively && statusMessageId) {
+		await updateMessage(
+			ctx,
+			statusMessageId,
+			formatStatus("Живой голос: пробуем исходный язык EN..."),
+		)
+	}
+		if (livelyRequested && !livelyEnabled && statusMessageId) {
+			await updateMessage(
+				ctx,
+				statusMessageId,
+				formatStatus(
+					"Живой голос запрошен, но OAuth токен не задан — используем обычный перевод.",
+				),
+			)
+		}
 	const maxWaitSeconds =
 		Number.isFinite(VOT_MAX_WAIT_SECONDS) && VOT_MAX_WAIT_SECONDS > 0
 			? VOT_MAX_WAIT_SECONDS
 			: 300
-	let waitedSeconds = 0
 	while (true) {
 		if (signal?.aborted) throw new Error("Cancelled")
-		const response = await client.translateVideo({
-			videoData,
-			requestLang: VOT_REQUEST_LANG,
-			responseLang: VOT_RESPONSE_LANG,
-			shouldSendFailedAudio: true,
-		})
+		const client = getVotClient(mode)
+		let response: any
+		try {
+			response = await client.translateVideo({
+				videoData,
+				requestLang,
+				responseLang: VOT_RESPONSE_LANG,
+				extraOpts: livelyEnabled ? { useLivelyVoice: true } : undefined,
+				shouldSendFailedAudio: true,
+			})
+		} catch (error: any) {
+			const data = error?.data
+			const message = String(error?.message || data?.message || "")
+			if (livelyEnabled) {
+				const authRequired =
+					data?.status === 7 || /auth required|oauth|token/i.test(message)
+				if (authRequired) {
+					livelyEnabled = false
+					if (requestLang !== baseRequestLang) {
+						requestLang = baseRequestLang
+					}
+					logTranslate("lively_fallback", {
+						mode,
+						url: redactUrl(url),
+						reason: message,
+					})
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								formatStatus(
+									"Живой голос недоступен, переключаюсь на обычный перевод...",
+								),
+							)
+						}
+					await sleepMs(1000)
+					continue
+				}
+				const livelyNotAllowed =
+					/обычная озвучка|only.*(обычная|regular)|unknown (source|language)/i.test(
+						message,
+					)
+				if (livelyNotAllowed) {
+					livelyEnabled = false
+					if (requestLang !== baseRequestLang) {
+						requestLang = baseRequestLang
+					}
+					logTranslate("lively_fallback", {
+						mode,
+						url: redactUrl(url),
+						reason: message,
+					})
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								formatStatus(
+									"Живой голос недоступен для этого видео, переключаюсь на обычный перевод...",
+								),
+							)
+						}
+					await sleepMs(1000)
+					continue
+				}
+			}
+			const shouldRetry =
+				Boolean(data?.shouldRetry) ||
+				(typeof data?.message === "string" &&
+					/попробуйте позже|try again/i.test(data.message))
+			if (shouldRetry) {
+				attempts += 1
+				const remainingSeconds = pickRetryDelaySeconds(data)
+				const intervalSeconds = Math.min(
+					remainingSeconds && remainingSeconds > 0 ? remainingSeconds : 15,
+					60,
+				)
+				waitedSeconds += intervalSeconds
+				if (waitedSeconds > maxWaitSeconds) {
+					throw new Error("Translation timed out")
+				}
+				if (
+					mode === "worker" &&
+					waitedSeconds >= fallbackAfterSeconds &&
+					VOT_WORKER_HOST
+				) {
+					mode = "direct"
+					logTranslate("switch_to_direct", {
+						waitedSeconds,
+						fallbackAfterSeconds,
+						requestLang,
+						url: redactUrl(url),
+					})
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								formatStatus(
+									"Очередь worker слишком длинная, переключаюсь на прямой VOT...",
+								),
+							)
+						}
+					await sleepMs(1000)
+					continue
+				}
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							formatStatus("Перевод готовится, ждём"),
+						)
+					}
+					logTranslate("retry", {
+						mode,
+						requestLang,
+						wait: intervalSeconds,
+						attempt: attempts,
+						url: redactUrl(url),
+						reason: data?.message,
+					})
+					await waitWithCountdown(
+						() => "Перевод готовится, ждём",
+						intervalSeconds,
+					)
+					continue
+				}
+			throw error
+		}
 		const audioUrl = pickVotAudioUrl(response)
-		if (audioUrl) return audioUrl
+			if (audioUrl) {
+				logTranslate("audio_url", {
+					mode,
+					requestLang,
+					url: redactUrl(url),
+					audioUrl: redactUrl(audioUrl),
+					waitedSeconds,
+					totalSeconds: Math.round((Date.now() - startedAt) / 1000),
+				})
+			return audioUrl
+		}
 		if (response?.translated === false) {
 			const remainingRaw = Number(
 				response?.remainingTime ?? response?.remaining_time,
@@ -1175,16 +1504,23 @@ const translateWithVot = async (
 			if (waitedSeconds > maxWaitSeconds) {
 				throw new Error("Translation timed out")
 			}
-			if (statusMessageId) {
-				await updateMessage(
-					ctx,
-					statusMessageId,
-					`Перевод готовится, ждём ${intervalSeconds}с...`,
-				)
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						formatStatus("Перевод готовится, ждём"),
+					)
+				}
+				logTranslate("queued", {
+					mode,
+					requestLang,
+					wait: intervalSeconds,
+					waitedSeconds,
+					url: redactUrl(url),
+				})
+				await waitWithCountdown(() => "Перевод готовится, ждём", intervalSeconds)
+				continue
 			}
-			await sleepMs(intervalSeconds * 1000)
-			continue
-		}
 		const message =
 			typeof response?.message === "string" && response.message.trim()
 				? response.message
@@ -3628,6 +3964,12 @@ const downloadAndSend = async (
 			let externalAudioApplied = false
 			if (externalAudio && !isMhtml) {
 				const translatedAudioPath = resolve(tempDir, "translated-audio.m4a")
+				const audioStart = Date.now()
+				logTranslate("audio_download_start", {
+					chat: ctx.chat?.id,
+					title,
+					url: redactUrl(externalAudio),
+				})
 				if (statusMessageId) {
 					await updateMessage(
 						ctx,
@@ -3654,8 +3996,20 @@ const downloadAndSend = async (
 					signal,
 				)
 				if (!(await fileExists(translatedAudioPath, 1024))) {
+					logTranslate("audio_download_failed", {
+						chat: ctx.chat?.id,
+						title,
+						url: redactUrl(externalAudio),
+					})
 					throw new Error("Translated audio download failed")
 				}
+				const translatedStats = await stat(translatedAudioPath).catch(() => null)
+				logTranslate("audio_downloaded", {
+					chat: ctx.chat?.id,
+					title,
+					bytes: translatedStats?.size,
+					seconds: Math.round((Date.now() - audioStart) / 1000),
+				})
 				const muxContainer = outputContainer === "mp4" ? "mp4" : "mkv"
 				const translatedBase = dashFileBase || safeTitle || "video"
 				const translatedPath = resolve(
@@ -3674,6 +4028,12 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: Микшируем перевод...`,
 					)
 				}
+				logTranslate("audio_mix_start", {
+					chat: ctx.chat?.id,
+					title,
+					container: muxContainer,
+					hasOriginalAudio,
+				})
 				const muxArgs = hasOriginalAudio
 					? [
 							"-y",
@@ -3725,6 +4085,11 @@ const downloadAndSend = async (
 					tempFilePath = translatedPath
 					outputContainer = muxContainer
 					externalAudioApplied = true
+					logTranslate("audio_mix_done", {
+						chat: ctx.chat?.id,
+						title,
+						container: muxContainer,
+					})
 				}
 				try {
 					await unlink(translatedAudioPath)
@@ -3975,32 +4340,54 @@ const runTranslatedDownload = async (params: {
 	} = params
 	const translateTarget = sourceUrl || url
 	let audioUrl = externalAudioUrl
-	if (!audioUrl) {
-		if (statusMessageId) {
-			await updateMessage(
-				ctx,
-				statusMessageId,
-				`Запрашиваем перевод...`,
-			)
+	const startedAt = Date.now()
+	logTranslate("request", {
+		chat: ctx.chat?.id,
+		url: redactUrl(translateTarget),
+		externalAudio: audioUrl ? redactUrl(audioUrl) : undefined,
+	})
+	try {
+		if (!audioUrl) {
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					formatVerboseStatus("Запрашиваем перевод...", {
+						time: `${Math.round((Date.now() - startedAt) / 1000)}s`,
+					}),
+				)
+			}
+			audioUrl = await translateWithVot(translateTarget, ctx, statusMessageId, signal)
 		}
-		audioUrl = await translateWithVot(translateTarget, ctx, statusMessageId, signal)
+		await downloadAndSend(
+			ctx,
+			url,
+			"b",
+			false,
+			statusMessageId,
+			overrideTitle,
+			replyToMessageId,
+			signal,
+			false,
+			undefined,
+			false,
+			sourceUrl,
+			false,
+			audioUrl,
+		)
+		logTranslate("complete", {
+			chat: ctx.chat?.id,
+			url: redactUrl(translateTarget),
+			totalSeconds: Math.round((Date.now() - startedAt) / 1000),
+		})
+	} catch (error) {
+		logTranslate("failed", {
+			chat: ctx.chat?.id,
+			url: redactUrl(translateTarget),
+			error: error instanceof Error ? error.message : String(error),
+		})
+		throw error
 	}
-	await downloadAndSend(
-		ctx,
-		url,
-		"b",
-		false,
-		statusMessageId,
-		overrideTitle,
-		replyToMessageId,
-		signal,
-		false,
-		undefined,
-		false,
-		sourceUrl,
-		false,
-		audioUrl,
-	)
 }
 
 bot.use(async (ctx, next) => {
@@ -6203,36 +6590,13 @@ bot.on("message:text", async (ctx, next) => {
 const userState = new Map<number, string>()
 const userPromptMessages = new Map<number, { chatId: number; messageId: number }>()
 
-bot.command("formats", async (ctx) => {
-	await deleteUserMessage(ctx)
-	const userId = ctx.from?.id
-	if (!userId) return
-	const previousPrompt = userPromptMessages.get(userId)
-	if (previousPrompt) {
-		try {
-			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
-		} catch {}
-		userPromptMessages.delete(userId)
-	}
-	userState.set(userId, "waiting_for_formats_url")
-	const prompt = await ctx.reply("Пришлите ссылку.")
-	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
-})
-
-bot.command("translate", async (ctx) => {
-	await deleteUserMessage(ctx)
-	const userId = ctx.from?.id
-	if (!userId) return
-	let urls = extractUrlsFromMessage(ctx.message)
-	if (urls.length === 0 && ctx.message?.reply_to_message) {
-		urls = extractUrlsFromMessage(ctx.message.reply_to_message)
-	}
-	const externalAudioUrl = urls.find(isYandexVtransUrl)
-	const rawUrl = urls.find((item) => !isYandexVtransUrl(item))
-	if (!rawUrl) {
-		await ctx.reply("Пришлите ссылку на видео для перевода.")
-		return
-	}
+const enqueueTranslateJob = async (
+	ctx: any,
+	userId: number,
+	rawUrl: string,
+	externalAudioUrl?: string,
+	replyToMessageId?: number,
+) => {
 	const sourceUrl = normalizeVimeoUrl(rawUrl)
 	void logUserLink(userId, sourceUrl, "requested")
 
@@ -6251,7 +6615,7 @@ bot.command("translate", async (ctx) => {
 				url: sourceUrl,
 				sourceUrl,
 				statusMessageId: processing.message_id,
-				replyToMessageId: ctx.message?.message_id,
+				replyToMessageId,
 				signal,
 				externalAudioUrl,
 			})
@@ -6282,6 +6646,55 @@ bot.command("translate", async (ctx) => {
 			)
 		}
 	})
+}
+
+bot.command("formats", async (ctx) => {
+	await deleteUserMessage(ctx)
+	const userId = ctx.from?.id
+	if (!userId) return
+	const previousPrompt = userPromptMessages.get(userId)
+	if (previousPrompt) {
+		try {
+			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
+		} catch {}
+		userPromptMessages.delete(userId)
+	}
+	userState.set(userId, "waiting_for_formats_url")
+	const prompt = await ctx.reply("Пришлите ссылку.")
+	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
+})
+
+bot.command("translate", async (ctx) => {
+	await deleteUserMessage(ctx)
+	const userId = ctx.from?.id
+	if (!userId) return
+	const previousPrompt = userPromptMessages.get(userId)
+	if (previousPrompt) {
+		try {
+			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
+		} catch {}
+		userPromptMessages.delete(userId)
+	}
+	userState.delete(userId)
+	let urls = extractUrlsFromMessage(ctx.message)
+	if (urls.length === 0 && ctx.message?.reply_to_message) {
+		urls = extractUrlsFromMessage(ctx.message.reply_to_message)
+	}
+	const externalAudioUrl = urls.find(isYandexVtransUrl)
+	const rawUrl = urls.find((item) => !isYandexVtransUrl(item))
+	if (!rawUrl) {
+		userState.set(userId, "waiting_for_translate_url")
+		const prompt = await ctx.reply("Пришлите ссылку на видео для перевода.")
+		userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
+		return
+	}
+	await enqueueTranslateJob(
+		ctx,
+		userId,
+		rawUrl,
+		externalAudioUrl,
+		ctx.message?.message_id,
+	)
 })
 
 bot.command("cancel", async (ctx) => {
@@ -6319,12 +6732,12 @@ bot.on("message:text", async (ctx, next) => {
 			userPromptMessages.delete(userId)
 		}
 		await deletePreviousMenuMessage(ctx)
-		await deleteUserMessage(ctx)
-		const urls = extractMessageUrls(ctx)
-		const externalAudioUrl = urls.find(isYandexVtransUrl)
-		const rawUrl =
-			urls.find((item) => !isYandexVtransUrl(item)) ||
-			(urls.length === 0 ? ctx.message.text : undefined)
+			await deleteUserMessage(ctx)
+			const urls = extractMessageUrls(ctx)
+			const externalAudioUrl = urls.find(isYandexVtransUrl)
+			const rawUrl =
+				urls.find((item) => !isYandexVtransUrl(item)) ||
+				(urls.length === 0 ? ctx.message.text : undefined)
 		if (!rawUrl) {
 			await ctx.reply("Invalid URL.")
 			return
@@ -6532,6 +6945,31 @@ bot.on("message:text", async (ctx, next) => {
 			}
 			await deleteMessage(processing)
 		}
+		return
+	}
+	if (state === "waiting_for_translate_url") {
+		userState.delete(userId)
+		const promptMessage = userPromptMessages.get(userId)
+		if (promptMessage) {
+			try {
+				await ctx.api.deleteMessage(promptMessage.chatId, promptMessage.messageId)
+			} catch {}
+			userPromptMessages.delete(userId)
+		}
+		await deletePreviousMenuMessage(ctx)
+		const replyToMessageId = ctx.message?.message_id
+		await deleteUserMessage(ctx)
+		const urls = extractMessageUrls(ctx)
+		const externalAudioUrl = urls.find(isYandexVtransUrl)
+		const rawUrl =
+			urls.find((item) => !isYandexVtransUrl(item)) ||
+			(urls.length === 0 ? ctx.message.text : undefined)
+		if (!rawUrl) {
+			await ctx.reply("Пришлите ссылку на видео для перевода.")
+			return
+		}
+		await enqueueTranslateJob(ctx, userId, rawUrl, externalAudioUrl, replyToMessageId)
+		return
 	} else {
 		await next()
 	}
