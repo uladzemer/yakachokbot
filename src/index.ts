@@ -115,6 +115,33 @@ const logTranslate = (message: string, details?: Record<string, unknown>) => {
 	}
 }
 
+const createTranslationUnsupportedError = (details?: string) => {
+	const error = new Error("TRANSLATION_UNSUPPORTED")
+	;(error as any).code = "TRANSLATION_UNSUPPORTED"
+	;(error as any).userMessage = "Перевод для этой площадки не поддерживается."
+	if (details) {
+		;(error as any).details = details
+	}
+	return error
+}
+
+const isTranslationUnsupportedError = (error: unknown) => {
+	if (!error) return false
+	const message = error instanceof Error ? error.message : String(error)
+	if ((error as any)?.code === "TRANSLATION_UNSUPPORTED") return true
+	if (message === "TRANSLATION_UNSUPPORTED") return true
+	return /unknown service|unsupported link|unsupported service|not supported/i.test(
+		message,
+	)
+}
+
+const getTranslationUnsupportedMessage = (error: unknown) => {
+	const message =
+		(error as any)?.userMessage ||
+		"Перевод для этой площадки не поддерживается."
+	return message
+}
+
 const formatVerboseStatus = (
 	base: string,
 	details?: Record<string, unknown>,
@@ -195,11 +222,17 @@ const execFilePromise = (
 const updateMessage = (() => {
 	const lastUpdates = new Map<number, number>()
 	const redirects = new Map<number, number>()
-	return async (ctx: any, messageId: number, text: string) => {
+	return async (
+		ctx: any,
+		messageId: number,
+		text: string,
+		options?: { force?: boolean },
+	) => {
+		const force = options?.force === true
 		const resolvedId = redirects.get(messageId) ?? messageId
 		const now = Date.now()
 		const last = lastUpdates.get(resolvedId) || 0
-		if (now - last < 1500) return
+		if (!force && now - last < 1500) return
 		lastUpdates.set(resolvedId, now)
 		try {
 			await ctx.api.editMessageText(ctx.chat.id, resolvedId, text, {
@@ -1322,7 +1355,16 @@ const translateWithVot = async (
 		Number.isFinite(VOT_WORKER_FALLBACK_SECONDS) && VOT_WORKER_FALLBACK_SECONDS > 0
 			? VOT_WORKER_FALLBACK_SECONDS
 			: 180
-	const videoData = await getVideoData(url)
+	let videoData: any
+	try {
+		videoData = await getVideoData(url)
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		if (/unknown service|unsupported link/i.test(message)) {
+			throw createTranslationUnsupportedError(message)
+		}
+		throw error
+	}
 	logTranslate("start", {
 		mode,
 		url: redactUrl(url),
@@ -1367,6 +1409,9 @@ const translateWithVot = async (
 		} catch (error: any) {
 			const data = error?.data
 			const message = String(error?.message || data?.message || "")
+			if (/unsupported service|not supported|unknown service/i.test(message)) {
+				throw createTranslationUnsupportedError(message)
+			}
 			if (livelyEnabled) {
 				const authRequired =
 					data?.status === 7 || /auth required|oauth|token/i.test(message)
@@ -6608,22 +6653,35 @@ const enqueueTranslateJob = async (
 	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
 	const processing = await ctx.reply("Ставим перевод в очередь...")
-	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
-		try {
-			await runTranslatedDownload({
-				ctx,
-				url: sourceUrl,
+		enqueueJob(userId, sourceUrl, lockId, async (signal) => {
+			try {
+				await runTranslatedDownload({
+					ctx,
+					url: sourceUrl,
 				sourceUrl,
 				statusMessageId: processing.message_id,
 				replyToMessageId,
 				signal,
-				externalAudioUrl,
-			})
-		} catch (error) {
-			console.error("Translate error:", error)
-			await logErrorEntry({
-				userId,
-				url: sourceUrl,
+					externalAudioUrl,
+				})
+			} catch (error) {
+				if (isTranslationUnsupportedError(error)) {
+					if (processing?.message_id) {
+						await updateMessage(
+							ctx,
+							processing.message_id,
+							getTranslationUnsupportedMessage(error),
+							{ force: true },
+						)
+					} else {
+						await ctx.reply(getTranslationUnsupportedMessage(error))
+					}
+					return
+				}
+				console.error("Translate error:", error)
+				await logErrorEntry({
+					userId,
+					url: sourceUrl,
 				context: "translate",
 				error: error instanceof Error ? error.message : String(error),
 			})
@@ -7573,23 +7631,36 @@ bot.on("callback_query:data", async (ctx) => {
 		requestCache.delete(requestId)
 		await deletePreviousMenuMessage(ctx)
 		const processing = await ctx.reply("Ставим перевод в очередь...")
-		enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
-			try {
-				await runTranslatedDownload({
-					ctx,
-					url: cached.url,
+			enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
+				try {
+					await runTranslatedDownload({
+						ctx,
+						url: cached.url,
 					sourceUrl: cached.sourceUrl,
 					statusMessageId: processing.message_id,
 					replyToMessageId: ctx.callbackQuery.message?.message_id,
 					signal,
-					overrideTitle: cached.title,
-					externalAudioUrl: cached.externalAudioUrl,
-				})
-			} catch (error) {
-				console.error("Translate callback error:", error)
-				await logErrorEntry({
-					userId,
-					url: cached.sourceUrl || cached.url,
+						overrideTitle: cached.title,
+						externalAudioUrl: cached.externalAudioUrl,
+					})
+				} catch (error) {
+					if (isTranslationUnsupportedError(error)) {
+						if (processing?.message_id) {
+							await updateMessage(
+								ctx,
+								processing.message_id,
+								getTranslationUnsupportedMessage(error),
+								{ force: true },
+							)
+						} else {
+							await ctx.reply(getTranslationUnsupportedMessage(error))
+						}
+						return
+					}
+					console.error("Translate callback error:", error)
+					await logErrorEntry({
+						userId,
+						url: cached.sourceUrl || cached.url,
 					context: "translate",
 					error: error instanceof Error ? error.message : String(error),
 				})
