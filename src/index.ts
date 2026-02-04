@@ -7055,10 +7055,23 @@ bot.on("message:text", async (ctx, next) => {
 })
 
 bot.on("my_chat_member", async (ctx) => {
-	if (ctx.myChatMember.new_chat_member.status === "member" || ctx.myChatMember.new_chat_member.status === "administrator") {
+	const status = ctx.myChatMember.new_chat_member.status
+	const chatType = ctx.chat?.type
+	if (status !== "member" && status !== "administrator") return
+
+	if (chatType === "group" || chatType === "supergroup" || chatType === "channel") {
+		try {
+			await ctx.api.leaveChat(ctx.chat.id)
+		} catch (error) {
+			console.error("Failed to leave group:", error)
+		}
+		return
+	}
+
+	if (chatType === "private") {
 		await ctx.replyWithHTML(
 			`<b>Hello!</b> I'm ready to download videos here.\n\n` +
-			`I work in <b>Silent Mode</b>: just send a link (TikTok, YouTube, Instagram, etc.), and I'll reply with the video. No commands needed!`,
+				`I work in <b>Silent Mode</b>: just send a link (TikTok, YouTube, Instagram, etc.), and I'll reply with the video. No commands needed!`,
 		)
 	}
 })
