@@ -40,7 +40,7 @@ services:
       # set to enable Yandex lively voice translation (requires OAuth token)
       VOT_LIVELY_VOICE: "${VOT_LIVELY_VOICE}"
       VOT_OAUTH_TOKEN: "${VOT_OAUTH_TOKEN}"
-      VOT_MAX_WAIT_SECONDS: "900"
+      VOT_MAX_WAIT_SECONDS: "1800"
 
       # provide your cobalt instance url (optional, can be left as-is for the default compose.yml)
       COBALT_INSTANCE_URL: "http://cobalt:9000"

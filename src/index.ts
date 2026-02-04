@@ -63,6 +63,8 @@ import { readJsonFile, writeFileAtomic } from "./file-util"
 import { execFile, spawn, type ExecFileOptions } from "node:child_process"
 
 const TEMP_PREFIX = "yakachokbot-"
+const AUDIO_LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+const AUDIO_LOUDNORM_MUSIC_FILTER = "loudnorm=I=-14:TP=-1.0:LRA=11"
 const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 	? Math.max(1, CLEANUP_INTERVAL_HOURS)
 	: 6
@@ -2980,17 +2982,31 @@ const downloadAndSend = async (
 			return
 		}
 
-		let formatArgs: string[] = []
-		let fallbackFormatArgs: string[] | undefined
-		if (selectedIsRawFormat) {
-			if (isMp3Format) {
-				formatArgs = ["-f", "251", "-x", "--audio-format", "mp3"]
-			} else {
-				formatArgs = ["-f", selectedQuality]
-			}
-		} else if (selectedQuality === "audio") {
-			formatArgs = ["-x", "--audio-format", "mp3"]
-		} else if (isDirectHls) {
+			let formatArgs: string[] = []
+			let fallbackFormatArgs: string[] | undefined
+			if (selectedIsRawFormat) {
+				if (isMp3Format) {
+					formatArgs = [
+						"-f",
+						"251",
+						"-x",
+						"--audio-format",
+						"mp3",
+						"--postprocessor-args",
+						`ffmpeg:-af ${AUDIO_LOUDNORM_MUSIC_FILTER}`,
+					]
+				} else {
+					formatArgs = ["-f", selectedQuality]
+				}
+			} else if (selectedQuality === "audio") {
+				formatArgs = [
+					"-x",
+					"--audio-format",
+					"mp3",
+					"--postprocessor-args",
+					`ffmpeg:-af ${AUDIO_LOUDNORM_MUSIC_FILTER}`,
+				]
+			} else if (isDirectHls) {
 			formatArgs = ["-f", "best"]
 			} else if (selectedQuality === "b") {
 				if (isYouTube) {
@@ -3474,17 +3490,19 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: Скачиваем перевод...`,
 					)
 				}
-				await spawnPromise(
-					"ffmpeg",
-					[
-						"-y",
-						"-i",
-						externalAudio,
-						"-vn",
-						"-c:a",
-						"aac",
-						"-b:a",
-						"192k",
+					await spawnPromise(
+						"ffmpeg",
+						[
+							"-y",
+							"-i",
+							externalAudio,
+							"-vn",
+							"-af",
+							AUDIO_LOUDNORM_FILTER,
+							"-c:a",
+							"aac",
+							"-b:a",
+							"192k",
 						"-ar",
 						"48000",
 						tempFilePath,
@@ -4087,7 +4105,7 @@ const downloadAndSend = async (
 							"-i",
 							translatedAudioPath,
 							"-filter_complex",
-							"[0:a]volume=0.35[a0];[a0][1:a]amix=inputs=2:weights=0.35 1.0:normalize=0[a]",
+							`[0:a]${AUDIO_LOUDNORM_FILTER},volume=0.35[a0];[a0][1:a]amix=inputs=2:weights=0.35 1.0:normalize=0[a]`,
 							"-map",
 							"0:v:0",
 							"-map",
@@ -4177,6 +4195,8 @@ const downloadAndSend = async (
 						"copy",
 						"-c:a",
 						audioTranscodeCodec === "aac" ? "aac" : "libopus",
+						"-af",
+						AUDIO_LOUDNORM_FILTER,
 					]
 					if (audioTranscodeCodec === "aac") {
 						ffmpegArgs.push(

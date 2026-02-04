@@ -45,7 +45,7 @@ export const VOT_STATUS_VERBOSE = getVariable("VOT_STATUS_VERBOSE", "false") ===
 export const VOT_LIVELY_VOICE = getVariable("VOT_LIVELY_VOICE", "false") === "true"
 export const VOT_OAUTH_TOKEN = getVariable("VOT_OAUTH_TOKEN", "")
 export const VOT_MAX_WAIT_SECONDS = Number.parseInt(
-	getVariable("VOT_MAX_WAIT_SECONDS", "900"),
+	getVariable("VOT_MAX_WAIT_SECONDS", "1800"),
 )
 export const CLEANUP_INTERVAL_HOURS = Number.parseInt(
 	getVariable("CLEANUP_INTERVAL_HOURS", "6"),
