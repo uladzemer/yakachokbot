@@ -3260,8 +3260,14 @@ const downloadAndSend = async (
 					"15",
 					"--extractor-args",
 					"vimeo:original_format_policy=never",
-				]
+			]
 			: []
+		const resolveCaptionUrl = async (rawUrl: string) => {
+			if (isTiktok && tiktokShortMatcher(rawUrl)) {
+				return await resolveTiktokShortUrl(rawUrl)
+			}
+			return rawUrl
+		}
 		const refererArgs = shouldAttachReferer(sourceUrl || url)
 			? getRefererHeaderArgs(sourceUrl || url)
 			: []
@@ -3317,7 +3323,8 @@ const downloadAndSend = async (
 
 		if (isDirectHls && !isAudioRequest) {
 			const title = overrideTitle || "Video"
-			const captionUrl = sourceUrl || url
+			const rawCaptionUrl = sourceUrl || url
+			const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
 			const caption = link(title, cleanUrl(captionUrl))
 			if (statusMessageId) {
 				await updateMessage(
@@ -3331,7 +3338,7 @@ const downloadAndSend = async (
 				"-user_agent",
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 				"-headers",
-				`Referer: ${captionUrl}\r\n`,
+				`Referer: ${rawCaptionUrl}\r\n`,
 				"-i",
 				url,
 				"-c",
@@ -3559,7 +3566,8 @@ const downloadAndSend = async (
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 		const title = overrideTitle || resolvedTitle
-		const captionUrl = sourceUrl || url
+		const rawCaptionUrl = sourceUrl || url
+		const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
 		const captionBase = link(title || "Video", cleanUrl(captionUrl))
 		const caption = externalAudioIsYandex
 			? `${captionBase}\nПеревод: Yandex`
@@ -7921,6 +7929,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				Array.isArray(tiktokPhotoData.photo_urls) &&
 				tiktokPhotoData.photo_urls.length > 0
 			) {
+				const captionSourceUrl = tiktokShortMatcher(sourceUrl)
+					? await resolveTiktokShortUrl(sourceUrl)
+					: sourceUrl
 				const authorName =
 					typeof tiktokPhotoData.author_name === "string"
 						? tiktokPhotoData.author_name.trim()
@@ -7934,8 +7945,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					? link(escapeHtml(authorLabel), `https://www.tiktok.com/@${authorUsername}`)
 					: escapeHtml(authorLabel)
 				const caption = authorLabel
-					? `Автор: ${authorLink}\n${link("Источник", cleanUrl(sourceUrl))}`
-					: link("TikTok", cleanUrl(sourceUrl))
+					? `Автор: ${authorLink}\n${link("Источник", cleanUrl(captionSourceUrl))}`
+					: link("TikTok", cleanUrl(captionSourceUrl))
 				await sendPhotoUrls(
 					ctx,
 					tiktokPhotoData.photo_urls,
