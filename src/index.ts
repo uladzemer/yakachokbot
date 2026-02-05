@@ -7100,7 +7100,15 @@ bot.on("message:text", async (ctx, next) => {
 
 const userState = new Map<number, string>()
 const userPromptMessages = new Map<number, { chatId: number; messageId: number }>()
-const taskOptions = new Map<number, { translate?: boolean; sponsor?: boolean }>()
+const taskOptions = new Map<
+	number,
+	{
+		url?: string
+		replyToMessageId?: number
+		translate?: boolean
+		sponsor?: boolean
+	}
+>()
 
 const buildTaskKeyboard = (prefix: string) => {
 	return new InlineKeyboard().text("Да", `${prefix}:yes`).text("Нет", `${prefix}:no`)
@@ -7334,9 +7342,8 @@ bot.command("task", async (ctx) => {
 	}
 	userState.delete(userId)
 	taskOptions.set(userId, { translate: undefined, sponsor: undefined })
-	const prompt = await ctx.reply("Наложить перевод (Yandex)?", {
-		reply_markup: buildTaskKeyboard("task:translate"),
-	})
+	userState.set(userId, "waiting_for_task_url")
+	const prompt = await ctx.reply("Пришлите ссылку на видео.")
 	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
 })
 
@@ -7619,17 +7626,18 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Invalid URL.")
 			return
 		}
-		const options = taskOptions.get(userId)
-		taskOptions.delete(userId)
-		const translate = options?.translate ?? false
-		const sponsor = options?.sponsor ?? false
-		await enqueueTaskJob(
-			ctx,
-			userId,
-			rawUrl,
-			{ translate, sponsor },
+		const prompt = await ctx.reply("Наложить перевод (Yandex)?", {
+			reply_markup: buildTaskKeyboard("task:translate"),
+		})
+		userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
+		const current = taskOptions.get(userId) ?? {}
+		taskOptions.set(userId, {
+			...current,
+			url: rawUrl,
 			replyToMessageId,
-		)
+			translate: undefined,
+			sponsor: undefined,
+		})
 		return
 	}
 	if (state === "waiting_for_translate_url") {
@@ -8191,7 +8199,13 @@ bot.on("callback_query:data", async (ctx) => {
 		if (!userId) return await ctx.answerCallbackQuery()
 		const value = data.split(":")[2]
 		const translate = value === "yes"
-		const current = taskOptions.get(userId) ?? {}
+		const current = taskOptions.get(userId)
+		if (!current?.url) {
+			return await ctx.answerCallbackQuery({
+				text: "Ссылка устарела. Повторите /task.",
+				show_alert: true,
+			})
+		}
 		taskOptions.set(userId, { ...current, translate })
 		try {
 			await ctx.editMessageText("Убрать рекламные фрагменты?", {
@@ -8205,18 +8219,35 @@ bot.on("callback_query:data", async (ctx) => {
 		if (!userId) return await ctx.answerCallbackQuery()
 		const value = data.split(":")[2]
 		const sponsor = value === "yes"
-		const current = taskOptions.get(userId) ?? {}
-		taskOptions.set(userId, { ...current, sponsor })
-		userState.set(userId, "waiting_for_task_url")
-		const messageId = ctx.callbackQuery.message?.message_id
-		if (messageId) {
-			userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId })
+		const current = taskOptions.get(userId)
+		if (!current?.url) {
+			return await ctx.answerCallbackQuery({
+				text: "Ссылка устарела. Повторите /task.",
+				show_alert: true,
+			})
 		}
+		const updated = { ...current, sponsor }
+		taskOptions.set(userId, updated)
+		userState.delete(userId)
+		userPromptMessages.delete(userId)
+		const replyToMessageId = updated.replyToMessageId
+		const url = updated.url
+		taskOptions.delete(userId)
 		try {
-			await ctx.editMessageText("Пришлите ссылку на видео.", {
+			await ctx.editMessageText("Ставим задачу в очередь...", {
 				reply_markup: new InlineKeyboard(),
 			})
 		} catch {}
+		await enqueueTaskJob(
+			ctx,
+			userId,
+			url,
+			{
+				translate: updated.translate ?? false,
+				sponsor: updated.sponsor ?? false,
+			},
+			replyToMessageId,
+		)
 		return await ctx.answerCallbackQuery({ text: "Ок" })
 	}
 	if (data.startsWith("ban:")) {
