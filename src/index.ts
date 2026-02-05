@@ -7153,6 +7153,16 @@ const buildSponsorCategoriesKeyboard = () => {
 		.text("Все фрагменты", "task:sponsor_categories:all")
 }
 
+const scheduleDeleteMessage = (
+	message?: { chat: { id: number }; message_id: number },
+	delayMs = 20000,
+) => {
+	if (!message?.chat?.id || !message?.message_id) return
+	setTimeout(() => {
+		void deleteMessage(message as any)
+	}, delayMs)
+}
+
 const enqueueTranslateJob = async (
 	ctx: any,
 	userId: number,
@@ -7251,6 +7261,7 @@ const enqueueTaskJob = async (
 	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
 	const processing = await ctx.reply("Ставим задачу в очередь...")
+	scheduleDeleteMessage(processing)
 	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
 		if (options.translate) {
 			try {
@@ -8293,6 +8304,7 @@ bot.on("callback_query:data", async (ctx) => {
 					reply_markup: new InlineKeyboard(),
 				})
 			} catch {}
+			scheduleDeleteMessage(ctx.callbackQuery?.message as any)
 			await enqueueTaskJob(
 				ctx,
 				userId,
@@ -8348,6 +8360,7 @@ bot.on("callback_query:data", async (ctx) => {
 				reply_markup: new InlineKeyboard(),
 			})
 		} catch {}
+		scheduleDeleteMessage(ctx.callbackQuery?.message as any)
 		await enqueueTaskJob(
 			ctx,
 			userId,
