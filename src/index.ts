@@ -2170,16 +2170,62 @@ const buildInstagramCaption = async (url: string) => {
 	return `Источник: ${link("Instagram", clean)}`
 }
 
+const downloadPhotoInputFile = async (url: string, index: number) => {
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 10000)
+	try {
+		const res = await fetch(url, {
+			signal: controller.signal,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+			},
+		})
+		if (!res.ok) {
+			throw new Error(`HTTP ${res.status}`)
+		}
+		const buffer = await res.arrayBuffer()
+		const filename = `photo_${index + 1}.jpg`
+		return new InputFile(new Uint8Array(buffer), filename)
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
 const sendPhotoUrls = async (
 	ctx: any,
 	photoUrls: string[],
 	caption: string,
 	threadId?: number,
 	replyToMessageId?: number,
+	forceUpload = false,
 ) => {
-	if (photoUrls.length === 0) return
-	if (photoUrls.length === 1) {
-		await ctx.replyWithPhoto(photoUrls[0], {
+	const uniqueUrls = Array.from(
+		new Set(
+			photoUrls
+				.map((url) => (typeof url === "string" ? url.trim() : ""))
+				.filter(Boolean),
+		),
+	)
+	if (uniqueUrls.length === 0) return
+	if (uniqueUrls.length === 1) {
+		const url = uniqueUrls[0]
+		if (forceUpload) {
+			try {
+				const inputFile = await downloadPhotoInputFile(url, 0)
+				await ctx.replyWithPhoto(inputFile, {
+					caption,
+					parse_mode: "HTML",
+					reply_to_message_id: replyToMessageId,
+					message_thread_id: threadId,
+				})
+				return
+			} catch (error) {
+				console.error("Failed to download single photo, fallback to URL", error)
+			}
+		}
+		await ctx.replyWithPhoto(url, {
 			caption,
 			parse_mode: "HTML",
 			reply_to_message_id: replyToMessageId,
@@ -2187,15 +2233,34 @@ const sendPhotoUrls = async (
 		})
 		return
 	}
-	const groups = chunkArray(10, photoUrls)
+	const groups = chunkArray(10, uniqueUrls)
 	let isFirst = true
+	let offset = 0
 	for (const group of groups) {
-		const media = group.map((url, index) => ({
-			type: "photo" as const,
-			media: url,
-			caption: isFirst && index === 0 ? caption : undefined,
-			parse_mode: isFirst && index === 0 ? "HTML" : undefined,
-		}))
+		const media: Array<{
+			type: "photo"
+			media: string | InputFile
+			caption?: string
+			parse_mode?: string
+		}> = []
+		for (let i = 0; i < group.length; i += 1) {
+			const url = group[i]
+			let mediaValue: string | InputFile = url
+			if (forceUpload) {
+				try {
+					const inputFile = await downloadPhotoInputFile(url, offset + i)
+					mediaValue = inputFile
+				} catch (error) {
+					console.error("Failed to download photo, fallback to URL", error)
+				}
+			}
+			media.push({
+				type: "photo",
+				media: mediaValue,
+				caption: isFirst && i === 0 ? caption : undefined,
+				parse_mode: isFirst && i === 0 ? "HTML" : undefined,
+			})
+		}
 		try {
 			await ctx.api.sendMediaGroup(ctx.chat.id, media, {
 				reply_to_message_id: replyToMessageId,
@@ -2207,18 +2272,27 @@ const sendPhotoUrls = async (
 			for (const [index, url] of group.entries()) {
 				const withCaption = isFirst && index === 0
 				try {
-					await ctx.replyWithPhoto(url, {
+					let mediaValue: string | InputFile = url
+					if (forceUpload) {
+						try {
+							mediaValue = await downloadPhotoInputFile(url, offset + index)
+						} catch (photoError) {
+							console.error("Failed to download photo, fallback to URL", photoError)
+						}
+					}
+					await ctx.replyWithPhoto(mediaValue, {
 						caption: withCaption ? caption : undefined,
 						parse_mode: withCaption ? "HTML" : undefined,
 						reply_to_message_id: replyToMessageId,
 						message_thread_id: threadId,
 					})
 				} catch (photoError) {
-					console.error("Failed to send Threads photo", photoError)
+					console.error("Failed to send photo", photoError)
 				}
 				if (withCaption) isFirst = false
 			}
 		}
+		offset += group.length
 	}
 }
 
@@ -7449,6 +7523,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					caption,
 					threadId,
 					ctx.message.message_id,
+					true,
 				)
 				await logUserLink(userId, sourceUrl, "success")
 				return
