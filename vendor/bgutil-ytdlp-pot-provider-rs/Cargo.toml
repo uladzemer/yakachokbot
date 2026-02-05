@@ -1,0 +1,130 @@
+[package]
+name = "bgutil-ytdlp-pot-provider"
+version = "0.6.4"
+edition = "2024"
+authors = ["Jim Chen <Jim@ChenJ.im>", "Brian Le <brainicism@gmail.com>"]
+description = "BgUtils POT Provider - Rust implementation for generating YouTube POT tokens"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs"
+homepage = "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs"
+documentation = "https://docs.rs/bgutil-ytdlp-pot-provider"
+readme = "README.md"
+keywords = ["yt-dlp", "pot-provider", "youtube", "bgutils"]
+categories = ["api-bindings", "development-tools", "multimedia", "command-line-utilities"]
+
+exclude = [
+    ".github/",
+    "/server/",
+    "plugin/",
+    "scripts/",
+    "docs/",
+    "target/",
+    "*.log",
+    "*.tmp",
+    "**/.DS_Store",
+    "Cargo.lock",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Linting configuration
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_doc_tests = "warn"
+invalid_rust_codeblocks = "warn"
+bare_urls = "warn"
+
+[lints.clippy]
+missing_docs_in_private_items = "allow" # Allow missing private docs
+doc_markdown = "allow"                  # Allow markdown formatting
+
+[lints.rust]
+missing_docs = "allow" # Allow missing docs at rust level
+
+[dependencies]
+# Dependencies
+# HTTP server
+tokio = { version = "1.43.0", features = ["full"] }
+axum = "0.8.4"
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+# Serialization
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.135"
+
+# CLI framework
+clap = { version = "4.5.46", features = ["derive", "cargo"] }
+
+# Axum macros for better debug messages
+axum-macros = "0.5.0"
+
+# Async HTTP client
+reqwest = { version = "0.12.12", features = ["json", "stream", "rustls-tls"] }
+
+# Logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0.95"
+thiserror = "2.0.16"
+
+# Date/time
+chrono = { version = "0.4.39", features = ["serde"] }
+
+# Cross-platform directories
+dirs = "6.0.0"
+
+# Configuration file parsing
+toml = "0.9.5"
+
+# URL parsing and validation
+url = "2.5.4"
+
+# BotGuard integration - using dedicated Rust crate
+rustypipe-botguard = "0.1.2"
+
+# Time handling (used by rustypipe-botguard)
+time = { version = "0.3.43", features = ["formatting", "parsing"] }
+
+# Base64 encoding/decoding
+base64 = "0.22.1"
+
+# Async trait support for testing
+async-trait = "0.1.89"
+
+[dev-dependencies]
+# Testing frameworks and utilities
+tokio-test = "0.4.4"
+tower-test = "0.4.0"
+tempfile = "3.16.0"
+assert_cmd = "2.0.16"
+predicates = "3.1.2"
+
+# HTTP mocking for testing
+mockito = "1.7.0"
+
+# Professional testing tools for enhanced TDD workflow
+wiremock = "0.6.4"           # HTTP service mocking
+serde_path_to_error = "0.1.17" # Enhanced JSON error diagnostics
+pretty_assertions = "1.4.1"   # Improved test output formatting
+rstest = "0.26.1"            # Parameterized testing framework
+fake = "4.4.0"               # Test data generation
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[[bin]]
+name = "bgutil-pot"
+path = "src/main.rs"

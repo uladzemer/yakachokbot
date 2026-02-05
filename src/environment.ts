@@ -28,6 +28,11 @@ export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "true") !== "false"
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
 export const YTDL_PROXY = getVariable("YTDL_PROXY", "")
+export const YOUTUBE_PO_TOKEN = getVariable("YOUTUBE_PO_TOKEN", "")
+export const YOUTUBE_FETCH_POT = getVariable("YOUTUBE_FETCH_POT", "")
+export const YOUTUBE_POT_PROVIDER_URL = getVariable("YOUTUBE_POT_PROVIDER_URL", "")
+export const YOUTUBE_POT_DISABLE_INNERTUBE =
+	getVariable("YOUTUBE_POT_DISABLE_INNERTUBE", "")
 export const ADMIN_DASHBOARD_TOKEN = getVariable("ADMIN_DASHBOARD_TOKEN", "")
 export const ADMIN_DASHBOARD_PORT = getVariable("ADMIN_DASHBOARD_PORT", "3000")
 export const ADMIN_DASHBOARD_HOST = getVariable("ADMIN_DASHBOARD_HOST", "127.0.0.1")

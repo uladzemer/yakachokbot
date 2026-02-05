@@ -14,6 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install yt-dlp and dependencies
 RUN pip install -U "yt-dlp[impersonate]" "curl_cffi" --break-system-packages
 
+# Install Rust bgutil PO token provider plugin for yt-dlp
+RUN rm -rf /usr/local/lib/python3.11/dist-packages/yt_dlp_plugins \
+  && curl -fsSL "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-ytdlp-pot-provider-rs.zip" -o /tmp/bgutil-ytdlp-pot-provider-rs.zip \
+  && python3 -c "import zipfile; zipfile.ZipFile('/tmp/bgutil-ytdlp-pot-provider-rs.zip').extractall('/usr/local/lib/python3.11/dist-packages')" \
+  && rm -f /tmp/bgutil-ytdlp-pot-provider-rs.zip
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./

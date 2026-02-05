@@ -38,6 +38,10 @@ docker compose up -d
 | `TELEGRAM_WEBHOOK_URL`  | URL вебхука (если используете вебхук)                                                                                      |
 | `YTDL_AUTOUPDATE`       | Автообновление yt-dlp (`"true"` или `"false"`, по умолчанию `"true"`)                                                      |
 | `YTDL_PROXY`            | Прокси для yt-dlp (например `socks5://user:pass@host:port`, по умолчанию не задан)                                         |
+| `YOUTUBE_PO_TOKEN`      | PO‑token(ы) для YouTube (формат `client.context+TOKEN`, несколько через запятую)                                          |
+| `YOUTUBE_FETCH_POT`     | Политика получения PO‑token через провайдера (`auto`/`always`/`never`, опционально)                                       |
+| `YOUTUBE_POT_PROVIDER_URL` | Базовый URL PO‑token провайдера (например `http://bgutil-pot-provider:4416`)                                          |
+| `YOUTUBE_POT_DISABLE_INNERTUBE` | Отключить innertube у провайдера (`"true"`/`"false"`, опционально)                                               |
 | `OPENAI_API_KEY`        | Ключ OpenAI (опционально, авто‑переводы)                                                                                   |
 | `CLEANUP_INTERVAL_HOURS` | Интервал очистки временных файлов в /tmp (часы, по умолчанию 6)                                                            |
 | `CLEANUP_MAX_AGE_HOURS`  | Максимальный возраст временных файлов в /tmp (часы, по умолчанию 12)                                                       |
@@ -63,6 +67,9 @@ docker compose up -d
 ```bash
 docker compose restart telegram-bot
 ```
+
+Если после cookies продолжает появляться ошибка «Requested format is not available», настройте `YOUTUBE_PO_TOKEN`.
+Если используете PO‑token провайдер (например bgutil), укажите `YOUTUBE_POT_PROVIDER_URL` (в docker‑compose это будет адрес сервиса).
 
 [yt-dlp]: https://github.com/yt-dlp/yt-dlp
 [telegram-api-id]: https://core.telegram.org/api/obtaining_api_id

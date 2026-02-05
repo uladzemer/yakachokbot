@@ -35,7 +35,7 @@ if (cobaltInstanceInfo) {
 
 const cobaltRegexes = [
 	// tiktok photo slides
-	/^(?:https:\/\/)?(?:www\.)?tiktok\.com\/@\w+\/photo\/\d+.*/,
+	/^(?:https:\/\/)?(?:www\.)?tiktok\.com\/@[\w.]+\/photo\/\d+.*/,
 
 	// threads
 	/^(?:https:\/\/)?(?:www\.)?threads\.(?:net|com)\/@\w+\/post\/.+/,

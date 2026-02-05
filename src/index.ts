@@ -43,6 +43,10 @@ import {
 	PROXY_FILE,
 	USERS_FILE,
 	YTDL_PROXY,
+	YOUTUBE_FETCH_POT,
+	YOUTUBE_PO_TOKEN,
+	YOUTUBE_POT_PROVIDER_URL,
+	YOUTUBE_POT_DISABLE_INNERTUBE,
 	WHITELISTED_IDS,
 	VOT_REQUEST_LANG,
 	VOT_RESPONSE_LANG,
@@ -1578,12 +1582,97 @@ const translateWithVot = async (
 	}
 }
 
-const youtubeExtractorArgs = [
-	"--extractor-args",
-	"youtube:player_client=tv,web_safari",
-	"--remote-components",
-	"ejs:github",
-]
+const normalizeDelimitedList = (value: string) =>
+	value
+		.split(/[\s,]+/)
+		.map((item) => item.trim())
+		.filter(Boolean)
+
+const YOUTUBE_FETCH_POT_OPTIONS = new Set(["auto", "always", "never"])
+const youtubeFetchPotPolicy = (() => {
+	const value = YOUTUBE_FETCH_POT.trim().toLowerCase()
+	if (!value) return ""
+	if (YOUTUBE_FETCH_POT_OPTIONS.has(value)) return value
+	console.warn(`[WARN] Unknown YOUTUBE_FETCH_POT value: ${YOUTUBE_FETCH_POT}`)
+	return ""
+})()
+const youtubePoTokenValue = normalizeDelimitedList(YOUTUBE_PO_TOKEN).join(",")
+const youtubePotProviderUrl = YOUTUBE_POT_PROVIDER_URL.trim()
+const youtubePotDisableInnertube = ["1", "true", "yes"].includes(
+	YOUTUBE_POT_DISABLE_INNERTUBE.trim().toLowerCase(),
+)
+const youtubePotProviderArgs = (() => {
+	if (!youtubePotProviderUrl) return []
+	const params = [`base_url=${youtubePotProviderUrl}`]
+	if (youtubePotDisableInnertube) {
+		params.push("disable_innertube=1")
+	}
+	return ["--extractor-args", `youtubepot-bgutilhttp:${params.join(";")}`]
+})()
+
+const youtubeExtractorArgs = (() => {
+	const args = [
+		"--extractor-args",
+		"youtube:player_client=tv,web_safari",
+		"--remote-components",
+		"ejs:github",
+	]
+	if (youtubePoTokenValue) {
+		args.push("--extractor-args", `youtube:po_token=${youtubePoTokenValue}`)
+	}
+	if (youtubeFetchPotPolicy) {
+		args.push("--extractor-args", `youtube:fetch_pot=${youtubeFetchPotPolicy}`)
+	}
+	if (youtubePotProviderArgs.length > 0) {
+		args.push(...youtubePotProviderArgs)
+	}
+	return args
+})()
+
+const tiktokShortMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (host === "vt.tiktok.com" || host === "vm.tiktok.com") return true
+		if (host.endsWith("tiktok.com") && /^\/t\//.test(parsed.pathname)) return true
+		return false
+	} catch {
+		return false
+	}
+}
+
+const resolveTiktokShortUrl = async (url: string) => {
+	if (!tiktokShortMatcher(url)) return url
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 5000)
+	try {
+		const res = await fetch(url, {
+			signal: controller.signal,
+			redirect: "follow",
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				Accept: "text/html",
+			},
+		})
+		if (res.body) {
+			try {
+				await res.body.cancel()
+			} catch {}
+		}
+		const resolved = res.url || url
+		if (resolved && resolved !== url) {
+			console.log(`[DEBUG] Resolved TikTok short URL: ${url} -> ${resolved}`)
+			return cleanUrl(resolved)
+		}
+		return url
+	} catch (e) {
+		console.warn("TikTok short URL resolve error", e)
+		return url
+	} finally {
+		clearTimeout(timeout)
+	}
+}
 
 const soraMatcher = (url: string) => url.includes("sora.chatgpt.com")
 
@@ -1601,6 +1690,68 @@ const resolveSora = async (url: string) => {
 }
 
 const xfreeMatcher = (url: string) => url.includes("xfree.com")
+
+const pornoxoMatcher = (url: string) => {
+	try {
+		return urlMatcher(url, "pornoxo.com")
+	} catch {
+		return false
+	}
+}
+
+const pornoxoPageMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("pornoxo.com")) return false
+		return /\/videos\/\d+/.test(parsed.pathname) || /\/embed\/\d+\/\d+/.test(parsed.pathname)
+	} catch {
+		return false
+	}
+}
+
+const resolvePornoxo = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/pornoxo_bypass.py",
+			url,
+		])
+		const trimmed = stdout.trim()
+		if (!trimmed) return { error: "Empty response from pornoxo resolver" }
+		return JSON.parse(trimmed)
+	} catch (e) {
+		console.error("Pornoxo resolve error", e)
+		return { error: "Failed to run pornoxo resolver" }
+	}
+}
+
+const tiktokPhotoMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		return (
+			parsed.hostname.endsWith("tiktok.com") &&
+			/\/photo\/\d+/.test(parsed.pathname)
+		)
+	} catch {
+		return false
+	}
+}
+
+const resolveTiktokPhoto = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/tiktok_photo_bypass.py",
+			url,
+			COOKIE_FILE,
+			PROXY_FILE,
+		])
+		const trimmed = stdout.trim()
+		if (!trimmed) return { error: "Empty response from tiktok photo resolver" }
+		return JSON.parse(trimmed)
+	} catch (e) {
+		console.error("TikTok photo resolve error", e)
+		return { error: "Failed to run tiktok photo resolver" }
+	}
+}
 
 const resolveXfree = async (url: string) => {
 	try {
@@ -1877,6 +2028,7 @@ const shouldTryGenericFallback = (url: string) => {
 	if (urlMatcher(url, "tiktok.com")) return false
 	if (urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am"))
 		return false
+	if (urlMatcher(url, "pornoxo.com")) return false
 	if (isVimeoUrl(url)) return false
 	if (threadsMatcher(url) || soraMatcher(url) || xfreeMatcher(url)) return false
 	return true
@@ -2846,6 +2998,7 @@ const downloadAndSend = async (
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const isErome = urlMatcher(url, "erome.com")
 		const isVimeo = isVimeoUrl(url)
+		const isPornoxo = pornoxoMatcher(url)
 		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
 		let forceHlsDownload = selectedForceHls || isDirectHls
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -2853,7 +3006,7 @@ const downloadAndSend = async (
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo ? [] : await getProxyArgs()
+		const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",
@@ -3367,7 +3520,7 @@ const downloadAndSend = async (
 						return protocol.includes("m3u8") || protocol.includes("hls")
 					})))
 		const hlsPoTokenArgs =
-			isYouTube && isHlsDownload
+			isYouTube && isHlsDownload && !youtubeFetchPotPolicy
 				? ["--extractor-args", "youtube:fetch_pot=always"]
 				: []
 
@@ -6900,13 +7053,24 @@ bot.on("message:text", async (ctx, next) => {
 					console.error("CCV error:", ccvData.error)
 				}
 			}
+			const isPornoxo = pornoxoMatcher(downloadUrl)
+			const isPornoxoPage = pornoxoPageMatcher(downloadUrl)
+			if (isPornoxoPage) {
+				const pornoxoData = await resolvePornoxo(downloadUrl)
+				if (pornoxoData.video_url) {
+					downloadUrl = pornoxoData.video_url
+					bypassTitle = pornoxoData.title
+				} else if (pornoxoData.error) {
+					console.error("Pornoxo error:", pornoxoData.error)
+				}
+			}
 				const isYouTube = isYouTubeUrl(downloadUrl)
 				const cookieArgsList = await cookieArgs()
 				const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 				const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
 				const isVimeo = isVimeoUrl(downloadUrl)
 				const additionalArgs = isTiktok ? tiktokArgs : []
-				const proxyArgs = isVimeo ? [] : await getProxyArgs()
+				const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
 				const vimeoArgs = isVimeo
 					? [
 							"--sleep-requests",
@@ -7228,6 +7392,10 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	// Move queue logic to callback, here only prepare options
 	try {
 		await deletePreviousMenuMessage(ctx)
+		const resolvedTiktokUrl = await resolveTiktokShortUrl(url.text)
+		if (resolvedTiktokUrl !== url.text) {
+			url.text = resolvedTiktokUrl
+		}
 		let bypassTitle: string | undefined
 
 		const isSora = soraMatcher(url.text)
@@ -7250,6 +7418,55 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				bypassTitle = xfreeData.title
 			} else if (xfreeData.error) {
 				console.error("Xfree error:", xfreeData.error)
+			}
+		}
+
+		const isTiktokPhoto = tiktokPhotoMatcher(url.text)
+		if (isTiktokPhoto) {
+			const tiktokPhotoData = await resolveTiktokPhoto(url.text)
+			if (
+				Array.isArray(tiktokPhotoData.photo_urls) &&
+				tiktokPhotoData.photo_urls.length > 0
+			) {
+				const authorName =
+					typeof tiktokPhotoData.author_name === "string"
+						? tiktokPhotoData.author_name.trim()
+						: ""
+				const authorUsername =
+					typeof tiktokPhotoData.author_username === "string"
+						? tiktokPhotoData.author_username.trim()
+						: ""
+				const authorLabel = authorName || (authorUsername ? `@${authorUsername}` : "")
+				const authorLink = authorUsername
+					? link(escapeHtml(authorLabel), `https://www.tiktok.com/@${authorUsername}`)
+					: escapeHtml(authorLabel)
+				const caption = authorLabel
+					? `Автор: ${authorLink}\n${link("Источник", cleanUrl(sourceUrl))}`
+					: link("TikTok", cleanUrl(sourceUrl))
+				await sendPhotoUrls(
+					ctx,
+					tiktokPhotoData.photo_urls,
+					caption,
+					threadId,
+					ctx.message.message_id,
+				)
+				await logUserLink(userId, sourceUrl, "success")
+				return
+			}
+			if (tiktokPhotoData.error) {
+				console.error("TikTok photo error:", tiktokPhotoData.error)
+			}
+		}
+
+		const isPornoxo = pornoxoMatcher(url.text)
+		const isPornoxoPage = pornoxoPageMatcher(url.text)
+		if (isPornoxoPage) {
+			const pornoxoData = await resolvePornoxo(url.text)
+			if (pornoxoData.video_url) {
+				url.text = pornoxoData.video_url
+				bypassTitle = pornoxoData.title
+			} else if (pornoxoData.error) {
+				console.error("Pornoxo error:", pornoxoData.error)
 			}
 		}
 
@@ -7330,7 +7547,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const isYouTube = isYouTubeUrl(url.text)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo ? [] : await getProxyArgs()
+		const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",

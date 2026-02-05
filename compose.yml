@@ -30,6 +30,14 @@ services:
       YTDL_AUTOUPDATE: "true"
       # optional proxy for yt-dlp (e.g. socks5://user:pass@host:port)
       YTDL_PROXY: "${YTDL_PROXY}"
+      # optional YouTube PO token(s)
+      YOUTUBE_PO_TOKEN: "${YOUTUBE_PO_TOKEN}"
+      # optional PO token fetch policy when providers are installed: auto/always/never
+      YOUTUBE_FETCH_POT: "${YOUTUBE_FETCH_POT}"
+      # optional PO token provider base url (bgutil http provider)
+      YOUTUBE_POT_PROVIDER_URL: "${YOUTUBE_POT_PROVIDER_URL:-http://bgutil-pot-provider:4416}"
+      # optional: disable innertube for the provider (true/false)
+      YOUTUBE_POT_DISABLE_INNERTUBE: "${YOUTUBE_POT_DISABLE_INNERTUBE}"
 
       # provide your OpenAI API key to enable auto-translation (optional)
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
@@ -51,6 +59,8 @@ services:
         condition: service_healthy
       cobalt:
         condition: service_healthy
+      bgutil-pot-provider:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f \"tsx -r dotenv/config src/index.ts\" >/dev/null || exit 1"]
       interval: 10s
@@ -135,6 +145,20 @@ services:
       retries: 3
     mem_limit: 1g
     cpus: "1.0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bgutil-pot-provider:
+    image: bgutil-pot-provider:local
+    build:
+      context: ./vendor/bgutil-ytdlp-pot-provider-rs
+      dockerfile: Containerfile
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: "0.5"
     logging:
       driver: "json-file"
       options:
