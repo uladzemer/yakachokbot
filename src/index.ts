@@ -4835,6 +4835,7 @@ const runTranslatedDownload = async (params: {
 	signal?: AbortSignal
 	overrideTitle?: string
 	externalAudioUrl?: string
+	sponsorCutRequested?: boolean
 }) => {
 	const {
 		ctx,
@@ -4845,6 +4846,7 @@ const runTranslatedDownload = async (params: {
 		signal,
 		overrideTitle,
 		externalAudioUrl,
+		sponsorCutRequested = false,
 	} = params
 	const translateTarget = sourceUrl || url
 	let audioUrl = externalAudioUrl
@@ -4882,6 +4884,7 @@ const runTranslatedDownload = async (params: {
 			sourceUrl,
 			false,
 			audioUrl,
+			sponsorCutRequested,
 		)
 		logTranslate("complete", {
 			chat: ctx.chat?.id,
@@ -7097,6 +7100,11 @@ bot.on("message:text", async (ctx, next) => {
 
 const userState = new Map<number, string>()
 const userPromptMessages = new Map<number, { chatId: number; messageId: number }>()
+const taskOptions = new Map<number, { translate?: boolean; sponsor?: boolean }>()
+
+const buildTaskKeyboard = (prefix: string) => {
+	return new InlineKeyboard().text("Да", `${prefix}:yes`).text("Нет", `${prefix}:no`)
+}
 
 const enqueueTranslateJob = async (
 	ctx: any,
@@ -7169,16 +7177,18 @@ const enqueueTranslateJob = async (
 	})
 }
 
-const enqueueSponsorJob = async (
+const enqueueTaskJob = async (
 	ctx: any,
 	userId: number,
 	rawUrl: string,
+	options: { translate: boolean; sponsor: boolean },
 	replyToMessageId?: number,
 ) => {
 	const sourceUrl = normalizeVimeoUrl(rawUrl)
-	if (!isYouTubeUrl(sourceUrl)) {
-		await ctx.reply("SponsorBlock доступен только для YouTube.")
-		return
+	let sponsorCutRequested = options.sponsor
+	if (sponsorCutRequested && !isYouTubeUrl(sourceUrl)) {
+		sponsorCutRequested = false
+		await ctx.reply("SponsorBlock доступен только для YouTube. Продолжаем без вырезания.")
 	}
 	void logUserLink(userId, sourceUrl, "requested")
 	const lockResult = lockUserUrl(userId, sourceUrl)
@@ -7188,8 +7198,60 @@ const enqueueSponsorJob = async (
 	}
 	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
-	const processing = await ctx.reply("Ставим в очередь SponsorBlock...")
+	const processing = await ctx.reply("Ставим задачу в очередь...")
 	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
+		if (options.translate) {
+			try {
+				await runTranslatedDownload({
+					ctx,
+					url: sourceUrl,
+					sourceUrl,
+					statusMessageId: processing.message_id,
+					replyToMessageId,
+					signal,
+					sponsorCutRequested,
+				})
+			} catch (error) {
+				if (isTranslationUnsupportedError(error)) {
+					if (processing?.message_id) {
+						await updateMessage(
+							ctx,
+							processing.message_id,
+							getTranslationUnsupportedMessage(error),
+							{ force: true },
+						)
+					} else {
+						await ctx.reply(getTranslationUnsupportedMessage(error))
+					}
+					return
+				}
+				console.error("Translate task error:", error)
+				await logErrorEntry({
+					userId,
+					url: sourceUrl,
+					context: "task-translate",
+					error: error instanceof Error ? error.message : String(error),
+				})
+				if (processing?.message_id) {
+					await updateMessage(ctx, processing.message_id, "Ошибка перевода.")
+				}
+				if (ctx.chat?.type === "private") {
+					await createUserReportPrompt(
+						ctx,
+						`URL: ${cleanUrl(sourceUrl)}`,
+						error instanceof Error ? error.message : "Translation error",
+					)
+				}
+				await notifyAdminError(
+					ctx.chat,
+					`URL: ${cleanUrl(sourceUrl)}`,
+					error instanceof Error ? error.message : "Translation error",
+					ctx.from,
+					ctx.message,
+				)
+			}
+			return
+		}
 		await downloadAndSend(
 			ctx,
 			sourceUrl,
@@ -7205,7 +7267,7 @@ const enqueueSponsorJob = async (
 			sourceUrl,
 			false,
 			undefined,
-			true,
+			sponsorCutRequested,
 		)
 	})
 }
@@ -7259,7 +7321,7 @@ bot.command("translate", async (ctx) => {
 	)
 })
 
-bot.command("sponsor", async (ctx) => {
+bot.command("task", async (ctx) => {
 	await deleteUserMessage(ctx)
 	const userId = ctx.from?.id
 	if (!userId) return
@@ -7271,18 +7333,11 @@ bot.command("sponsor", async (ctx) => {
 		userPromptMessages.delete(userId)
 	}
 	userState.delete(userId)
-	let urls = extractUrlsFromMessage(ctx.message)
-	if (urls.length === 0 && ctx.message?.reply_to_message) {
-		urls = extractUrlsFromMessage(ctx.message.reply_to_message)
-	}
-	const rawUrl = urls[0]
-	if (!rawUrl) {
-		userState.set(userId, "waiting_for_sponsor_url")
-		const prompt = await ctx.reply("Пришлите ссылку на YouTube видео.")
-		userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
-		return
-	}
-	await enqueueSponsorJob(ctx, userId, rawUrl, ctx.message?.message_id)
+	taskOptions.set(userId, { translate: undefined, sponsor: undefined })
+	const prompt = await ctx.reply("Наложить перевод (Yandex)?", {
+		reply_markup: buildTaskKeyboard("task:translate"),
+	})
+	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
 })
 
 bot.command("cancel", async (ctx) => {
@@ -7546,7 +7601,7 @@ bot.on("message:text", async (ctx, next) => {
 		}
 		return
 	}
-	if (state === "waiting_for_sponsor_url") {
+	if (state === "waiting_for_task_url") {
 		userState.delete(userId)
 		const promptMessage = userPromptMessages.get(userId)
 		if (promptMessage) {
@@ -7564,7 +7619,17 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Invalid URL.")
 			return
 		}
-		await enqueueSponsorJob(ctx, userId, rawUrl, replyToMessageId)
+		const options = taskOptions.get(userId)
+		taskOptions.delete(userId)
+		const translate = options?.translate ?? false
+		const sponsor = options?.sponsor ?? false
+		await enqueueTaskJob(
+			ctx,
+			userId,
+			rawUrl,
+			{ translate, sponsor },
+			replyToMessageId,
+		)
 		return
 	}
 	if (state === "waiting_for_translate_url") {
@@ -8121,6 +8186,39 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 bot.on("callback_query:data", async (ctx) => {
 	const data = ctx.callbackQuery.data
+	if (data.startsWith("task:translate:")) {
+		const userId = ctx.from?.id
+		if (!userId) return await ctx.answerCallbackQuery()
+		const value = data.split(":")[2]
+		const translate = value === "yes"
+		const current = taskOptions.get(userId) ?? {}
+		taskOptions.set(userId, { ...current, translate })
+		try {
+			await ctx.editMessageText("Убрать рекламные фрагменты?", {
+				reply_markup: buildTaskKeyboard("task:sponsor"),
+			})
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Ок" })
+	}
+	if (data.startsWith("task:sponsor:")) {
+		const userId = ctx.from?.id
+		if (!userId) return await ctx.answerCallbackQuery()
+		const value = data.split(":")[2]
+		const sponsor = value === "yes"
+		const current = taskOptions.get(userId) ?? {}
+		taskOptions.set(userId, { ...current, sponsor })
+		userState.set(userId, "waiting_for_task_url")
+		const messageId = ctx.callbackQuery.message?.message_id
+		if (messageId) {
+			userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId })
+		}
+		try {
+			await ctx.editMessageText("Пришлите ссылку на видео.", {
+				reply_markup: new InlineKeyboard(),
+			})
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Ок" })
+	}
 	if (data.startsWith("ban:")) {
 		if (ctx.from?.id !== ADMIN_ID) {
 			return await ctx.answerCallbackQuery({
