@@ -6015,7 +6015,7 @@ bot.command("send", async (ctx) => {
 	}
 		try {
 			await bot.api.copyMessage(targetId, replied.chat.id, replied.message_id)
-			await ctx.reply(`Отправлено пользователю.\nID: ${code(String(targetId))}`)
+			await ctx.reply(`Отправлено пользователю.\nID: ${targetId}`)
 		} catch (error) {
 		await ctx.reply("Не удалось отправить. Проверьте, что пользователь писал боту.")
 		console.error("Failed to send admin media copy:", error)
