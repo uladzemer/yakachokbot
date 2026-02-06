@@ -62,7 +62,7 @@ services:
       bgutil-pot-provider:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f \"tsx -r dotenv/config src/index.ts\" >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "tr '\\0' ' ' </proc/1/cmdline | grep -F \"npm start\" >/dev/null || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 3

@@ -71,7 +71,8 @@ const AUDIO_LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 const AUDIO_LOUDNORM_MUSIC_FILTER = "loudnorm=I=-14:TP=-1.0:LRA=11"
 const TRANSLATION_AUDIO_FILTER = "alimiter=limit=0.9"
 const SPONSORBLOCK_BASE_URL = "https://sponsor.ajay.app"
-const SPONSORBLOCK_TIMEOUT_MS = 5000
+const SPONSORBLOCK_TIMEOUT_MS = 15000
+const SPONSORBLOCK_FETCH_RETRIES = 3
 const SPONSORBLOCK_MIN_GAP_SECONDS = 0.3
 const SPONSORBLOCK_DEFAULT_CATEGORIES = ["sponsor"]
 const SPONSORBLOCK_ALL_CATEGORIES = [
@@ -85,6 +86,12 @@ const SPONSORBLOCK_ALL_CATEGORIES = [
 	"filler",
 	"music_offtopic",
 ]
+
+const isAllSponsorCategoriesSelected = (categories?: string[]) => {
+	if (!Array.isArray(categories) || categories.length === 0) return false
+	const selected = new Set(categories)
+	return SPONSORBLOCK_ALL_CATEGORIES.every((category) => selected.has(category))
+}
 const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 	? Math.max(1, CLEANUP_INTERVAL_HOURS)
 	: 6
@@ -1232,42 +1239,68 @@ const fetchSponsorSegments = async (
 	videoId: string,
 	categories: string[] = SPONSORBLOCK_DEFAULT_CATEGORIES,
 ) => {
-	const controller = new AbortController()
-	const timeout = setTimeout(() => controller.abort(), SPONSORBLOCK_TIMEOUT_MS)
-	try {
-		const normalizedCategories =
-			Array.isArray(categories) && categories.length > 0
-				? categories
-				: SPONSORBLOCK_DEFAULT_CATEGORIES
-		const categoriesParam = encodeURIComponent(JSON.stringify(normalizedCategories))
-		const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categoriesParam}`
-		const res = await fetch(apiUrl, {
-			signal: controller.signal,
-			headers: {
-				"User-Agent":
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-			},
-		})
-		if (res.status === 404) return []
-		if (!res.ok) {
-			throw new Error(`SponsorBlock HTTP ${res.status}`)
+	const normalizedCategories =
+		Array.isArray(categories) && categories.length > 0
+			? categories
+			: SPONSORBLOCK_DEFAULT_CATEGORIES
+	const categoriesParam = encodeURIComponent(JSON.stringify(normalizedCategories))
+	const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categoriesParam}`
+
+	let lastError: unknown
+	for (let attempt = 1; attempt <= SPONSORBLOCK_FETCH_RETRIES; attempt += 1) {
+		const controller = new AbortController()
+		const timeout = setTimeout(() => controller.abort(), SPONSORBLOCK_TIMEOUT_MS)
+		try {
+			const res = await fetch(apiUrl, {
+				signal: controller.signal,
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				},
+			})
+			if (res.status === 404) return []
+			if (!res.ok) {
+				throw new Error(`SponsorBlock HTTP ${res.status}`)
+			}
+			const data = await res.json()
+			if (!Array.isArray(data)) return []
+			const ranges: Array<[number, number]> = []
+			for (const entry of data) {
+				const segment = entry?.segment
+				if (!Array.isArray(segment) || segment.length < 2) continue
+				const start = Number(segment[0])
+				const end = Number(segment[1])
+				if (!Number.isFinite(start) || !Number.isFinite(end)) continue
+				if (end <= start) continue
+				ranges.push([start, end])
+			}
+			return ranges
+		} catch (error) {
+			lastError = error
+			const name = (error as any)?.name
+			const message = error instanceof Error ? error.message : String(error)
+			const transient =
+				name === "AbortError" ||
+				/timed? ?out|network|fetch failed|socket|econnreset|etimedout/i.test(
+					message,
+				)
+			if (!transient || attempt >= SPONSORBLOCK_FETCH_RETRIES) {
+				throw error
+			}
+			const delayMs = 1000 * attempt
+			console.warn("[WARN] SponsorBlock fetch transient error, retrying", {
+				attempt,
+				delayMs,
+				error: message,
+			})
+			await sleepMs(delayMs)
+		} finally {
+			clearTimeout(timeout)
 		}
-		const data = await res.json()
-		if (!Array.isArray(data)) return []
-		const ranges: Array<[number, number]> = []
-		for (const entry of data) {
-			const segment = entry?.segment
-			if (!Array.isArray(segment) || segment.length < 2) continue
-			const start = Number(segment[0])
-			const end = Number(segment[1])
-			if (!Number.isFinite(start) || !Number.isFinite(end)) continue
-			if (end <= start) continue
-			ranges.push([start, end])
-		}
-		return ranges
-	} finally {
-		clearTimeout(timeout)
 	}
+	throw lastError instanceof Error
+		? lastError
+		: new Error("SponsorBlock fetch failed")
 }
 
 const mergeSponsorSegments = (segments: Array<[number, number]>, duration?: number) => {
@@ -1383,6 +1416,7 @@ const trimVideoByRanges = async (
 	outputPath: string,
 	container: string,
 	signal?: AbortSignal,
+	copyOnly = false,
 ) => {
 	const validRanges = ranges.filter(
 		([start, end]) => Number.isFinite(start) && Number.isFinite(end) && end - start >= 0.35,
@@ -1391,6 +1425,8 @@ const trimVideoByRanges = async (
 		throw new Error("No valid ranges for SponsorBlock trim")
 	}
 	const partFiles: string[] = []
+	const partTsFiles: string[] = []
+	let mp4TsConcatSucceeded = false
 	for (const [index, [start, end]] of validRanges.entries()) {
 		const partPath = `${inputPath}.sb_part_${index}.${container}`
 		const args = [
@@ -1452,81 +1488,155 @@ const trimVideoByRanges = async (
 	try {
 		await spawnPromise("ffmpeg", concatArgs, undefined, signal)
 	} catch (copyConcatError) {
-		console.warn("[WARN] SponsorBlock: concat copy failed, retrying with re-encode", {
-			container,
-			error:
-				copyConcatError instanceof Error
-					? copyConcatError.message
-					: String(copyConcatError),
-		})
-		const reencodeArgs = [
-			"-y",
-			"-f",
-			"concat",
-			"-safe",
-			"0",
-			"-fflags",
-			"+genpts",
-			"-avoid_negative_ts",
-			"make_zero",
-			"-i",
-			concatPath,
-		]
-		if (container === "webm") {
-			reencodeArgs.push(
-				"-c:v",
-				"libvpx-vp9",
-				"-crf",
-				"33",
-				"-b:v",
-				"0",
-				"-row-mt",
-				"1",
-				"-cpu-used",
-				"4",
-				"-c:a",
-				"libopus",
-				"-b:a",
-				"128k",
-			)
-		} else {
-			reencodeArgs.push(
-				"-c:v",
-				"libx264",
-				"-preset",
-				"veryfast",
-				"-crf",
-				"23",
-				"-c:a",
-				"aac",
-				"-b:a",
-				"160k",
-			)
+		if (copyOnly) {
 			if (container === "mp4") {
-				reencodeArgs.push("-movflags", "+faststart")
+				try {
+					for (const partFile of partFiles) {
+						const tsPath = `${partFile}.ts`
+						await spawnPromise(
+							"ffmpeg",
+							[
+								"-y",
+								"-i",
+								partFile,
+								"-c",
+								"copy",
+								"-bsf:v",
+								"h264_mp4toannexb",
+								"-f",
+								"mpegts",
+								tsPath,
+							],
+							undefined,
+							signal,
+						)
+						if (await fileExists(tsPath, 1024)) {
+							partTsFiles.push(tsPath)
+						}
+					}
+					if (partTsFiles.length >= 2) {
+						const concatProtocol = `concat:${partTsFiles
+							.map((file) => file.replace(/\|/g, "\\|"))
+							.join("|")}`
+						await spawnPromise(
+							"ffmpeg",
+							[
+								"-y",
+								"-i",
+								concatProtocol,
+								"-c",
+								"copy",
+								"-bsf:a",
+								"aac_adtstoasc",
+								"-movflags",
+								"+faststart",
+								outputPath,
+							],
+							undefined,
+							signal,
+						)
+						mp4TsConcatSucceeded = true
+					}
+				} catch (copyTsConcatError) {
+					console.warn("[WARN] SponsorBlock: mp4 ts concat copy failed", {
+						error:
+							copyTsConcatError instanceof Error
+								? copyTsConcatError.message
+								: String(copyTsConcatError),
+					})
+				}
+				if (mp4TsConcatSucceeded) {
+					// Keep stream copy behavior for "all categories" mode without re-encode.
+				} else {
+					throw copyConcatError
+				}
+			}
+			if (!mp4TsConcatSucceeded) {
+				throw copyConcatError
 			}
 		}
-		reencodeArgs.push(outputPath)
-		try {
-			await spawnPromise("ffmpeg", reencodeArgs, undefined, signal)
-		} catch (reencodeConcatError) {
-			console.warn("[WARN] SponsorBlock: concat re-encode failed, retrying trim via filter_complex", {
-				container,
-				error:
-					reencodeConcatError instanceof Error
-						? reencodeConcatError.message
-						: String(reencodeConcatError),
-			})
-			await trimVideoByRangesFilterFallback(
-				inputPath,
-				validRanges,
-				outputPath,
-				container,
-				signal,
-			)
+			if (!copyOnly || !mp4TsConcatSucceeded) {
+				console.warn("[WARN] SponsorBlock: concat copy failed, retrying with re-encode", {
+					container,
+					error:
+						copyConcatError instanceof Error
+							? copyConcatError.message
+							: String(copyConcatError),
+				})
+				const reencodeArgs = [
+					"-y",
+					"-f",
+					"concat",
+					"-safe",
+					"0",
+					"-fflags",
+					"+genpts",
+					"-avoid_negative_ts",
+					"make_zero",
+					"-i",
+					concatPath,
+				]
+				if (container === "webm") {
+					reencodeArgs.push(
+						"-c:v",
+						"libvpx-vp9",
+						"-crf",
+						"33",
+						"-b:v",
+						"0",
+						"-row-mt",
+						"1",
+						"-cpu-used",
+						"4",
+						"-c:a",
+						"libopus",
+						"-b:a",
+						"128k",
+					)
+				} else {
+					reencodeArgs.push(
+						"-c:v",
+						"libx264",
+						"-preset",
+						"veryfast",
+						"-crf",
+						"23",
+						"-c:a",
+						"aac",
+						"-b:a",
+						"160k",
+					)
+					if (container === "mp4") {
+						reencodeArgs.push("-movflags", "+faststart")
+					}
+				}
+				reencodeArgs.push(outputPath)
+				try {
+					await spawnPromise("ffmpeg", reencodeArgs, undefined, signal)
+				} catch (reencodeConcatError) {
+					console.warn("[WARN] SponsorBlock: concat re-encode failed, retrying trim via filter_complex", {
+						container,
+						error:
+							reencodeConcatError instanceof Error
+								? reencodeConcatError.message
+								: String(reencodeConcatError),
+					})
+					await trimVideoByRangesFilterFallback(
+						inputPath,
+						validRanges,
+						outputPath,
+						container,
+						signal,
+					)
+				}
+			}
 		}
-	}
 	for (const file of partFiles) {
+		try {
+			await unlink(file)
+		} catch {}
+	}
+	for (const file of partTsFiles) {
 		try {
 			await unlink(file)
 		} catch {}
@@ -3634,6 +3744,58 @@ const sendCombineAudioSection = async (
 const isAbortError = (error: unknown) =>
 	error instanceof Error && error.message === "Cancelled"
 
+const isTransientTelegramSendError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return (
+		/Network request for 'send(Video|Document)' failed/i.test(message) ||
+		/invalid json response body|unexpected end of json input/i.test(message) ||
+		/econnreset|etimedout|timed out|socket hang up|fetch failed|network/i.test(
+			message,
+		)
+	)
+}
+
+const isTelegramBrokenJsonResponseError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /invalid json response body|unexpected end of json input/i.test(message)
+}
+
+const runTelegramSendWithRetry = async <T>(
+	action: string,
+	send: () => Promise<T>,
+	maxAttempts = 5,
+) => {
+	let lastError: unknown
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			return await send()
+		} catch (error) {
+			lastError = error
+			if (isTelegramBrokenJsonResponseError(error)) {
+				// Local telegram-bot-api may close response body after upload succeeded.
+				console.warn(`[WARN] ${action} returned broken JSON response; treating as delivered`, {
+					error: error instanceof Error ? error.message : String(error),
+				})
+				return undefined as T
+			}
+			if (!isTransientTelegramSendError(error) || attempt >= maxAttempts) {
+				throw error
+			}
+			const delayMs = Math.min(60000, 4000 * attempt)
+			console.warn(`[WARN] ${action} transient network error, retrying`, {
+				attempt,
+				maxAttempts,
+				delayMs,
+				error: error instanceof Error ? error.message : String(error),
+			})
+			await sleepMs(delayMs)
+		}
+	}
+	throw lastError instanceof Error
+		? lastError
+		: new Error(`${action} failed after retries`)
+}
+
 const formatUserIdLinkHtml = (userId: number) =>
 	`<a href="tg://user?id=${userId}">${userId}</a>`
 
@@ -5381,17 +5543,21 @@ const downloadAndSend = async (
 											`Обработка: <b>${title}</b>\nСтатус: Вырезаем сегменты...`,
 										)
 									}
-									const sbBase = sanitizeFilePart(title || "video", "video")
-									const trimmedPath = resolve(
-										tempDir,
-										`${sbBase}_sb.${outputContainer}`,
-									)
+										const sbBase = sanitizeFilePart(title || "video", "video")
+										const trimmedPath = resolve(
+											tempDir,
+											`${sbBase}_sb.${outputContainer}`,
+										)
+										const copyOnlyTrim = isAllSponsorCategoriesSelected(
+											sponsorCategories,
+										)
 										await trimVideoByRanges(
 											tempFilePath,
 											keepRanges,
 											trimmedPath,
 											outputContainer,
 											signal,
+											copyOnlyTrim,
 										)
 										if (await fileExists(trimmedPath, 1024)) {
 											try {
@@ -5411,9 +5577,9 @@ const downloadAndSend = async (
 												)
 											}
 										}
+									}
 								}
 							}
-						}
 					} catch (error) {
 						console.error("SponsorBlock trim error:", error)
 					}
@@ -5437,29 +5603,33 @@ const downloadAndSend = async (
 						statusMessageId,
 						`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 					)
-				}
-				await ctx.replyWithChatAction("upload_document")
-				await ctx.replyWithDocument(new InputFile(tempFilePath), {
-					caption,
-					parse_mode: "HTML",
-					message_thread_id: threadId,
-				})
-			} else {
-				if (outputContainer !== "mp4") {
+					}
+					await ctx.replyWithChatAction("upload_document")
+					await runTelegramSendWithRetry("sendDocument", () =>
+						ctx.replyWithDocument(new InputFile(tempFilePath), {
+							caption,
+							parse_mode: "HTML",
+							message_thread_id: threadId,
+						}),
+					)
+				} else {
+					if (outputContainer !== "mp4") {
 					if (statusMessageId) {
 						await updateMessage(
 							ctx,
 							statusMessageId,
 							`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 						)
-					}
-					await ctx.replyWithChatAction("upload_document")
-					await ctx.replyWithDocument(new InputFile(tempFilePath), {
-						caption,
-						parse_mode: "HTML",
-						message_thread_id: threadId,
-					})
-				} else {
+						}
+						await ctx.replyWithChatAction("upload_document")
+						await runTelegramSendWithRetry("sendDocument", () =>
+							ctx.replyWithDocument(new InputFile(tempFilePath), {
+								caption,
+								parse_mode: "HTML",
+								message_thread_id: threadId,
+							}),
+						)
+					} else {
 					// Get metadata directly from the file
 					const metadata = await getVideoMetadata(tempFilePath)
 					const width = metadata.width || info.width
@@ -5467,22 +5637,18 @@ const downloadAndSend = async (
 					const duration = metadata.duration || info.duration
 					const isAv1Video = /av01|av1/i.test(resolvedVideoCodec)
 
-					// Generate local thumbnail to ensure correct aspect ratio in Telegram
-					await generateThumbnail(tempFilePath, tempThumbPath)
-					const thumbFile = (await fileExists(tempThumbPath, 256))
-						? new InputFile(tempThumbPath)
-						: undefined
-					if (!thumbFile) {
-						console.warn("[WARN] Thumbnail not available, sending without it", {
-							url: cleanUrl(url),
-							title,
-							tempThumbPath,
+						// Generate local thumbnail to ensure correct aspect ratio in Telegram
+						await generateThumbnail(tempFilePath, tempThumbPath)
+						const hasThumbFile = await fileExists(tempThumbPath, 256)
+						if (!hasThumbFile) {
+							console.warn("[WARN] Thumbnail not available, sending without it", {
+								url: cleanUrl(url),
+								title,
+								tempThumbPath,
 						})
 					}
 
-					const video = new InputFile(tempFilePath)
-
-					if (statusMessageId) {
+						if (statusMessageId) {
 						await updateMessage(
 							ctx,
 							statusMessageId,
@@ -5490,19 +5656,48 @@ const downloadAndSend = async (
 						)
 					}
 
-					await ctx.replyWithChatAction("upload_video")
-					const supportsStreaming =
-						outputContainer === "mp4" && !isTiktok && !isAv1Video
-					await ctx.replyWithVideo(video, {
-						caption,
-						parse_mode: "HTML",
-						supports_streaming: supportsStreaming,
-						duration,
-						width,
-						height,
-						thumbnail: thumbFile,
-						message_thread_id: threadId,
-					})
+						await ctx.replyWithChatAction("upload_video")
+						const supportsStreaming =
+							outputContainer === "mp4" && !isTiktok && !isAv1Video
+						try {
+							await runTelegramSendWithRetry("sendVideo", () =>
+								ctx.replyWithVideo(new InputFile(tempFilePath), {
+									caption,
+									parse_mode: "HTML",
+									supports_streaming: supportsStreaming,
+									duration,
+									width,
+									height,
+									thumbnail: hasThumbFile
+										? new InputFile(tempThumbPath)
+										: undefined,
+									message_thread_id: threadId,
+								}),
+							)
+						} catch (sendVideoError) {
+						console.warn("[WARN] sendVideo failed, retrying as document", {
+							url: cleanUrl(sourceUrl || url),
+							error:
+								sendVideoError instanceof Error
+									? sendVideoError.message
+									: String(sendVideoError),
+						})
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								`Обработка: <b>${title}</b>\nСтатус: Видео не отправилось, пробуем как файл...`,
+							)
+						}
+						await ctx.replyWithChatAction("upload_document")
+						await runTelegramSendWithRetry("sendDocument", () =>
+							ctx.replyWithDocument(new InputFile(tempFilePath), {
+								caption,
+								parse_mode: "HTML",
+								message_thread_id: threadId,
+							}),
+						)
+					}
 				}
 			}
 
