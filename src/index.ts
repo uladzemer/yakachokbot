@@ -3246,6 +3246,11 @@ type RequestCacheEntry = {
 	userId?: number
 	lockId?: string
 	externalAudioUrl?: string
+	selectedQuality?: string
+	selectedIsRawFormat?: boolean
+	selectedForceAudio?: boolean
+	selectedDashFormatLabel?: string
+	selectedForceHls?: boolean
 }
 type FormatEntry = {
 	format: any
@@ -8061,6 +8066,15 @@ const buildTaskKeyboard = (prefix: string) => {
 	return new InlineKeyboard().text("Да", `${prefix}:yes`).text("Нет", `${prefix}:no`)
 }
 
+const buildInlineSponsorDecisionKeyboard = (requestId: string) => {
+	return new InlineKeyboard()
+		.text("Без вырезки", `ds:${requestId}:none`)
+		.row()
+		.text("Только рекламу", `ds:${requestId}:sponsor`)
+		.row()
+		.text("Все фрагменты", `ds:${requestId}:all`)
+}
+
 const buildSponsorCategoriesKeyboard = () => {
 	return new InlineKeyboard()
 		.text("Только рекламную часть", "task:sponsor_categories:sponsor")
@@ -9744,7 +9758,7 @@ bot.on("callback_query:data", async (ctx) => {
 		)
 		return await ctx.answerCallbackQuery()
 	}
-	if (data.startsWith("ca:")) {
+		if (data.startsWith("ca:")) {
 		const [, requestId, videoId, audioId] = data.split(":")
 		if (!requestId || !videoId || !audioId) {
 			return await ctx.answerCallbackQuery({
@@ -9799,9 +9813,95 @@ bot.on("callback_query:data", async (ctx) => {
 				cached.externalAudioUrl,
 			)
 		})
-		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
-	}
-	if (!data.startsWith("d:")) return await ctx.answerCallbackQuery()
+			return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
+		}
+		if (data.startsWith("ds:")) {
+			const [, requestId, sponsorMode] = data.split(":")
+			if (!requestId || !sponsorMode) {
+				return await ctx.answerCallbackQuery({
+					text: "Invalid request.",
+					show_alert: true,
+				})
+			}
+			const cached = requestCache.get(requestId)
+			if (!cached) {
+				await ctx.answerCallbackQuery({
+					text: "Request expired or invalid.",
+					show_alert: true,
+				})
+				return await ctx.deleteMessage()
+			}
+			const userId = ctx.from?.id
+			if (!userId) return
+			if (cached.userId && cached.userId !== userId) {
+				await ctx.answerCallbackQuery({
+					text: "Это меню не для вас.",
+					show_alert: true,
+				})
+				return
+			}
+			const selectedQuality = cached.selectedQuality
+			if (!selectedQuality) {
+				return await ctx.answerCallbackQuery({
+					text: "Выберите качество заново.",
+					show_alert: true,
+				})
+			}
+			const effectiveLockId = cached.lockId
+			if (!effectiveLockId) {
+				await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
+				return
+			}
+			const sponsorCutRequested = sponsorMode === "sponsor" || sponsorMode === "all"
+			const sponsorCategories =
+				sponsorMode === "all"
+					? SPONSORBLOCK_ALL_CATEGORIES
+					: sponsorMode === "sponsor"
+						? SPONSORBLOCK_DEFAULT_CATEGORIES
+						: undefined
+			const lockUrl = getCacheLockUrl(cached)
+			const blockReason = getQueueBlockReason(userId, lockUrl, effectiveLockId)
+			if (blockReason) {
+				await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
+				return
+			}
+			const queuedQuality = selectedQuality
+			const queuedIsRawFormat = cached.selectedIsRawFormat ?? false
+			const queuedForceAudio = cached.selectedForceAudio ?? false
+			const queuedDashFormatLabel = cached.selectedDashFormatLabel
+			const queuedForceHls = cached.selectedForceHls ?? false
+			const queuedUrl = cached.url
+			const queuedTitle = cached.title
+			const queuedSourceUrl = cached.sourceUrl
+			const queuedExternalAudioUrl = cached.externalAudioUrl
+			requestCache.delete(requestId)
+			await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
+			await ctx.editMessageText(
+				`Скачиваем ${queuedQuality === "b" ? "Лучшее" : queuedQuality}...`,
+			)
+			enqueueJob(userId, lockUrl, effectiveLockId, async (signal) => {
+				await downloadAndSend(
+					ctx,
+					queuedUrl,
+					queuedQuality,
+					queuedIsRawFormat,
+					ctx.callbackQuery.message?.message_id,
+					queuedTitle,
+					ctx.callbackQuery.message?.reply_to_message?.message_id,
+					signal,
+					queuedForceAudio,
+					queuedDashFormatLabel,
+					queuedForceHls,
+					queuedSourceUrl,
+					false,
+					queuedExternalAudioUrl,
+					sponsorCutRequested,
+					sponsorCategories,
+				)
+			})
+			return
+		}
+		if (!data.startsWith("d:")) return await ctx.answerCallbackQuery()
 
 	const [, requestId, quality] = data.split(":")
 	if (!requestId || !quality) {
@@ -9880,10 +9980,23 @@ bot.on("callback_query:data", async (ctx) => {
 		await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
 		return
 	}
-	await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
-	await ctx.editMessageText(
-		`Скачиваем ${quality === "b" ? "Лучшее" : quality}...`,
-	)
+		const sponsorStepEligible =
+			isYouTubeUrl(cached.sourceUrl || cached.url) && !forceAudio && quality !== "audio"
+		if (sponsorStepEligible) {
+			cached.selectedQuality = quality
+			cached.selectedIsRawFormat = isRawFormat
+			cached.selectedForceAudio = forceAudio
+			cached.selectedDashFormatLabel = dashFormatLabel
+			cached.selectedForceHls = forceHls
+			requestCache.set(requestId, cached)
+			await ctx.answerCallbackQuery({ text: "Выберите режим SponsorBlock..." })
+			await ctx.editMessageText("Вырезать SponsorBlock фрагменты?", {
+				reply_markup: buildInlineSponsorDecisionKeyboard(requestId),
+			})
+			return
+		}
+		await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
+		await ctx.editMessageText(`Скачиваем ${quality === "b" ? "Лучшее" : quality}...`)
 	if (!effectiveLockId) {
 		await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
 		return
