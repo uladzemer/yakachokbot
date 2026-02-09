@@ -2504,6 +2504,13 @@ const resolveSora = async (url: string) => {
 }
 
 const xfreeMatcher = (url: string) => url.includes("xfree.com")
+const deviantsMatcher = (url: string) => {
+	try {
+		return urlMatcher(url, "deviants.com")
+	} catch {
+		return false
+	}
+}
 
 const pornoxoMatcher = (url: string) => {
 	try {
@@ -2578,6 +2585,72 @@ const resolveXfree = async (url: string) => {
 		console.error("Xfree resolve error", e)
 		return { error: "Failed to run bypass script" }
 	}
+}
+
+const resolveDeviants = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/deviants_bypass.py",
+			url,
+		])
+		const trimmed = stdout.trim()
+		if (!trimmed) return { error: "Empty response from deviants resolver" }
+		return JSON.parse(trimmed)
+	} catch (e) {
+		console.error("Deviants resolve error", e)
+		return { error: "Failed to run deviants resolver" }
+	}
+}
+
+type GenericBypassResult = {
+	video_url?: string
+	video_urls?: string[]
+	title?: string
+	error?: string
+}
+
+const resolveGenericBypass = async (url: string): Promise<GenericBypassResult> => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/generic_bypass.py",
+			url,
+		])
+		const trimmed = stdout.trim()
+		if (!trimmed) return { error: "Empty response from generic resolver" }
+		return JSON.parse(trimmed) as GenericBypassResult
+	} catch (e) {
+		console.error("Generic resolve error", e)
+		return { error: "Failed to run generic resolver" }
+	}
+}
+
+const isDirectMediaUrl = (url: string) => {
+	try {
+		return /\.(?:m3u8|mp4|mpd|mov|webm)(?:\?|$)/i.test(new URL(url).toString())
+	} catch {
+		return false
+	}
+}
+
+const shouldTryUniversalBypass = (url: string) => {
+	if (!url) return false
+	if (isDirectMediaUrl(url)) return false
+	if (isYouTubeUrl(url)) return false
+	if (urlMatcher(url, "tiktok.com")) return false
+	if (urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am"))
+		return false
+	if (isVimeoUrl(url)) return false
+	if (urlMatcher(url, "erome.com")) return false
+	if (isFacebookUrl(url)) return false
+	if (threadsMatcher(url)) return false
+	if (pinterestMatcher(url)) return false
+	if (behanceMatcher(url)) return false
+	if (ccvMatcher(url)) return false
+	if (soraMatcher(url)) return false
+	if (xfreeMatcher(url)) return false
+	if (pornoxoMatcher(url)) return false
+	if (deviantsMatcher(url)) return false
+	return true
 }
 
 const pinterestMatcher = (url: string) => {
@@ -2845,6 +2918,7 @@ const shouldTryGenericFallback = (url: string) => {
 	if (urlMatcher(url, "pornoxo.com")) return false
 	if (isVimeoUrl(url)) return false
 	if (threadsMatcher(url) || soraMatcher(url) || xfreeMatcher(url)) return false
+	if (deviantsMatcher(url)) return false
 	return true
 }
 
@@ -4029,8 +4103,33 @@ const downloadAndSend = async (
 	const externalAudioIsYandex = externalAudio
 		? isYandexVtransUrl(externalAudio)
 		: false
-	
+
 	try {
+		let usedUniversalBypass = false
+		if (deviantsMatcher(url)) {
+			const deviantsData = await resolveDeviants(url)
+			if (deviantsData.video_url) {
+				url = deviantsData.video_url
+				if (!overrideTitleResolved && deviantsData.title) {
+					overrideTitleResolved = deviantsData.title
+				}
+			} else if (deviantsData.error) {
+				console.error("Deviants error:", deviantsData.error)
+			}
+		}
+		if (shouldTryUniversalBypass(url)) {
+			const genericData = await resolveGenericBypass(url)
+			if (genericData.video_url) {
+				url = genericData.video_url
+				usedUniversalBypass = true
+				if (!overrideTitleResolved && genericData.title) {
+					overrideTitleResolved = genericData.title
+				}
+			} else if (genericData.error) {
+				console.error("Generic bypass error:", genericData.error)
+			}
+		}
+
 		const isTiktok = urlMatcher(url, "tiktok.com")
 		const isInstagram =
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
@@ -4038,6 +4137,7 @@ const downloadAndSend = async (
 		const isVimeo = isVimeoUrl(url)
 		const isFacebook = isFacebookUrl(url)
 		const isPornoxo = pornoxoMatcher(url)
+		const isDeviants = deviantsMatcher(sourceUrl || url)
 		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
 		let forceHlsDownload = selectedForceHls || isDirectHls
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -4045,7 +4145,10 @@ const downloadAndSend = async (
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
+		const proxyArgs =
+			isVimeo || isPornoxo || isFacebook || isDeviants || usedUniversalBypass
+				? []
+				: await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",
@@ -8603,6 +8706,29 @@ bot.on("message:text", async (ctx, next) => {
 					console.error("Pornoxo error:", pornoxoData.error)
 				}
 			}
+			const isDeviants = deviantsMatcher(downloadUrl)
+			if (isDeviants) {
+				const deviantsData = await resolveDeviants(downloadUrl)
+				if (deviantsData.video_url) {
+					downloadUrl = deviantsData.video_url
+					bypassTitle = deviantsData.title
+				} else if (deviantsData.error) {
+					console.error("Deviants error:", deviantsData.error)
+				}
+			}
+			let usedUniversalBypass = false
+			if (shouldTryUniversalBypass(downloadUrl)) {
+				const genericData = await resolveGenericBypass(downloadUrl)
+				if (genericData.video_url) {
+					downloadUrl = genericData.video_url
+					usedUniversalBypass = true
+					if (!bypassTitle && genericData.title) {
+						bypassTitle = genericData.title
+					}
+				} else if (genericData.error) {
+					console.error("Generic bypass error:", genericData.error)
+				}
+			}
 				const isYouTube = isYouTubeUrl(downloadUrl)
 				const cookieArgsList = await cookieArgs()
 				const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
@@ -8610,7 +8736,14 @@ bot.on("message:text", async (ctx, next) => {
 				const isVimeo = isVimeoUrl(downloadUrl)
 				const isFacebook = isFacebookUrl(downloadUrl)
 				const additionalArgs = isTiktok ? tiktokArgs : []
-				const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
+				const proxyArgs =
+					isVimeo ||
+					isPornoxo ||
+					isFacebook ||
+					isDeviants ||
+					usedUniversalBypass
+						? []
+						: await getProxyArgs()
 				const vimeoArgs = isVimeo
 					? [
 							"--sleep-requests",
@@ -9117,6 +9250,29 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				console.error("Pornoxo error:", pornoxoData.error)
 			}
 		}
+		const isDeviants = deviantsMatcher(url.text)
+		if (isDeviants) {
+			const deviantsData = await resolveDeviants(url.text)
+			if (deviantsData.video_url) {
+				url.text = deviantsData.video_url
+				bypassTitle = deviantsData.title
+			} else if (deviantsData.error) {
+				console.error("Deviants error:", deviantsData.error)
+			}
+		}
+		let usedUniversalBypass = false
+		if (shouldTryUniversalBypass(url.text)) {
+			const genericData = await resolveGenericBypass(url.text)
+			if (genericData.video_url) {
+				url.text = genericData.video_url
+				usedUniversalBypass = true
+				if (!bypassTitle && genericData.title) {
+					bypassTitle = genericData.title
+				}
+			} else if (genericData.error) {
+				console.error("Generic bypass error:", genericData.error)
+			}
+		}
 
 		const isThreads = threadsMatcher(url.text)
 		if (isThreads) {
@@ -9196,7 +9352,14 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const isYouTube = isYouTubeUrl(url.text)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
+		const proxyArgs =
+			isVimeo ||
+			isPornoxo ||
+			isFacebook ||
+			isDeviants ||
+			usedUniversalBypass
+				? []
+				: await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",
