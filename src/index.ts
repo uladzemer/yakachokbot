@@ -2506,7 +2506,13 @@ const resolveSora = async (url: string) => {
 const xfreeMatcher = (url: string) => url.includes("xfree.com")
 const deviantsMatcher = (url: string) => {
 	try {
-		return urlMatcher(url, "deviants.com")
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("deviants.com")) return false
+		return (
+			parsed.pathname.startsWith("/videos/") ||
+			parsed.pathname.startsWith("/embed/") ||
+			parsed.pathname.startsWith("/get_file/")
+		)
 	} catch {
 		return false
 	}
@@ -2592,7 +2598,7 @@ const resolveDeviants = async (url: string) => {
 		const { stdout } = await execFilePromise("python3", [
 			"src/deviants_bypass.py",
 			url,
-		])
+		], { timeout: 25000 })
 		const trimmed = stdout.trim()
 		if (!trimmed) return { error: "Empty response from deviants resolver" }
 		return JSON.parse(trimmed)
@@ -2955,6 +2961,81 @@ const normalizeVimeoUrl = (input: string) => {
 const isFormatUnavailableError = (error: unknown) => {
 	const message = error instanceof Error ? error.message : String(error)
 	return /requested format is not available/i.test(message)
+}
+
+const isCloudflareChallengeError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /cloudflare anti-bot challenge|cf-mitigated|just a moment|attention required/i.test(
+		message,
+	)
+}
+
+const getUrlPathname = (url: string) => {
+	try {
+		return new URL(url).pathname.toLowerCase()
+	} catch {
+		return ""
+	}
+}
+
+const isDirectFileUrl = (url: string) =>
+	/\.(?:mp4|webm|mov|mkv)(?:\/?(?:\?|$)|$)/i.test(url)
+
+const inferDirectFileExt = (url: string) => {
+	const path = getUrlPathname(url).replace(/\/+$/, "")
+	const match = path.match(/\.([a-z0-9]+)$/i)
+	const ext = match?.[1]?.toLowerCase()
+	if (ext === "mp4" || ext === "webm" || ext === "mov" || ext === "mkv") {
+		return ext
+	}
+	return "mp4"
+}
+
+const buildDirectMediaInfo = (url: string, title?: string) => {
+	const ext = inferDirectFileExt(url)
+	return {
+		id: "direct_media",
+		title: title || "Video",
+		webpage_url: url,
+		url,
+		ext,
+		vcodec: "h264",
+		acodec: "aac",
+		protocol: "https",
+		formats: [
+			{
+				format_id: "direct",
+				format: `direct ${ext}`,
+				protocol: "https",
+				ext,
+				vcodec: "h264",
+				acodec: "aac",
+				url,
+			},
+		],
+	}
+}
+
+const downloadDirectFile = async (
+	url: string,
+	outputPath: string,
+	referer: string | undefined,
+	signal?: AbortSignal,
+) => {
+	let resolvedUrl = url
+	if (urlMatcher(url, "deviants.com") && /\/get_file\//i.test(url)) {
+		const deviantsData = await resolveDeviants(url)
+		if (typeof deviantsData?.video_url === "string" && deviantsData.video_url) {
+			resolvedUrl = deviantsData.video_url
+		}
+	}
+	const args = ["src/direct_media_download.py", url, outputPath]
+	if (referer) args.push(referer)
+	args[1] = resolvedUrl
+	await spawnPromise("python3", args, undefined, signal)
+	if (!(await fileExists(outputPath, 1024))) {
+		throw new Error("Direct media download failed")
+	}
 }
 
 const isRateLimitError = (error: unknown) => {
@@ -4175,6 +4256,76 @@ const downloadAndSend = async (
 			: []
 
 		if (
+			isDirectFileUrl(url) &&
+			!forceAudio &&
+			selectedQuality !== "audio" &&
+			!(selectedIsRawFormat && selectedQuality === "mp3")
+		) {
+			const title = overrideTitleResolved || "Video"
+			const rawCaptionUrl = sourceUrl || url
+			const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
+			const caption = link(title, cleanUrl(captionUrl))
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Обработка: <b>${title}</b>\nСтатус: Прямая загрузка...`,
+				)
+			}
+			await downloadDirectFile(url, tempFilePath, rawCaptionUrl, signal)
+			const metadata = await getVideoMetadata(tempFilePath)
+			await generateThumbnail(tempFilePath, tempThumbPath)
+			const thumbFile = (await fileExists(tempThumbPath, 256))
+				? new InputFile(tempThumbPath)
+				: undefined
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+				)
+			}
+			try {
+				await runWithPersistentChatAction(ctx, "upload_video", () =>
+					ctx.replyWithVideo(new InputFile(tempFilePath), {
+						caption,
+						parse_mode: "HTML",
+						supports_streaming: true,
+						duration: metadata.duration,
+						width: metadata.width,
+						height: metadata.height,
+						thumbnail: thumbFile,
+						message_thread_id: threadId,
+					}),
+				)
+			} catch (sendVideoError) {
+				console.warn("[WARN] Direct sendVideo failed, retrying as document", {
+					url: cleanUrl(sourceUrl || url),
+					error:
+						sendVideoError instanceof Error
+							? sendVideoError.message
+							: String(sendVideoError),
+				})
+				await runWithPersistentChatAction(ctx, "upload_document", () =>
+					ctx.replyWithDocument(new InputFile(tempFilePath), {
+						caption,
+						parse_mode: "HTML",
+						message_thread_id: threadId,
+					}),
+				)
+			}
+			if (statusMessageId) {
+				await deleteStatusMessage(ctx, statusMessageId)
+			}
+			if (replyToMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, replyToMessageId)
+				} catch {}
+			}
+			return
+		}
+
+		if (
 			isFacebookCdnVideoUrl(url) &&
 			!externalAudio &&
 			!forceAudio &&
@@ -4475,11 +4626,21 @@ const downloadAndSend = async (
 
 		const maxInfoAttempts = isVimeo ? 4 : 1
 		let info: any
+		let usedDirectInfoFallback = false
 		for (let attempt = 1; attempt <= maxInfoAttempts; attempt += 1) {
 			try {
 				info = await fetchInfoOnce()
 				break
 			} catch (error) {
+				if (
+					!isAudioRequest &&
+					isDirectFileUrl(url) &&
+					isCloudflareChallengeError(error)
+				) {
+					info = buildDirectMediaInfo(url, overrideTitleResolved)
+					usedDirectInfoFallback = true
+					break
+				}
 				if (isVimeo && isRateLimitError(error) && attempt < maxInfoAttempts) {
 					const delayMs = 30000 * Math.pow(2, attempt - 1)
 					if (statusMessageId) {
@@ -5354,6 +5515,34 @@ const downloadAndSend = async (
 						downloadSucceeded = true
 					} catch (error) {
 						lastDownloadError = error
+						if (
+							!downloadSucceeded &&
+							!isAudioRequest &&
+							(isDirectFileUrl(url) || usedDirectInfoFallback) &&
+							isCloudflareChallengeError(error)
+						) {
+							if (statusMessageId) {
+								await updateMessage(
+									ctx,
+									statusMessageId,
+									`Обработка: <b>${title}</b>\nСтатус: Прямая загрузка...`,
+								)
+							}
+							try {
+								await downloadDirectFile(
+									url,
+									tempFilePath,
+									sourceUrl || url,
+									signal,
+								)
+								downloadSucceeded = true
+							} catch (directError) {
+								lastDownloadError = directError
+							}
+						}
+						if (downloadSucceeded) {
+							// Skip yt-dlp fallbacks when direct downloader succeeded.
+						} else {
 						for (const attempt of genericFallbacks) {
 							if (statusMessageId) {
 								await updateMessage(
@@ -5393,6 +5582,7 @@ const downloadAndSend = async (
 							} catch (proxyError) {
 								lastDownloadError = proxyError
 							}
+						}
 						}
 					}
 				}
@@ -8800,7 +8990,16 @@ bot.on("message:text", async (ctx, next) => {
 						? lastError
 						: new Error("No valid info")
 				}
-				const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+				let info: any
+				try {
+					info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+				} catch (error) {
+					if (isDirectFileUrl(downloadUrl) && isCloudflareChallengeError(error)) {
+						info = buildDirectMediaInfo(downloadUrl, bypassTitle)
+					} else {
+						throw error
+					}
+				}
 			if (expectedFacebookStoryFbid && typeof info?.webpage_url === "string") {
 				const actualFacebookStoryFbid = extractFacebookStoryFbid(info.webpage_url)
 				if (
@@ -9424,7 +9623,16 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				? lastError
 				: new Error("No valid info")
 		}
-		const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+		let info: any
+		try {
+			info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+		} catch (error) {
+			if (isDirectFileUrl(url.text) && isCloudflareChallengeError(error)) {
+				info = buildDirectMediaInfo(url.text, bypassTitle)
+			} else {
+				throw error
+			}
+		}
 		if (expectedFacebookStoryFbid && typeof info?.webpage_url === "string") {
 			const actualFacebookStoryFbid = extractFacebookStoryFbid(info.webpage_url)
 			if (

@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp nightly and dependencies
-RUN pip install -U --pre "yt-dlp[impersonate]" "curl_cffi" --break-system-packages
+# Install yt-dlp nightly and pin a curl_cffi version supported by yt-dlp impersonation
+RUN pip install -U --pre "yt-dlp[impersonate]" "curl_cffi==0.11.4" --break-system-packages
 
 # Install Rust bgutil PO token provider plugin for yt-dlp
 RUN rm -rf /usr/local/lib/python3.11/dist-packages/yt_dlp_plugins \
