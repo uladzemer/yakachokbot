@@ -80,6 +80,8 @@ const SPONSORBLOCK_TIMEOUT_MS = 15000
 const SPONSORBLOCK_FETCH_RETRIES = 3
 const SPONSORBLOCK_MIN_GAP_SECONDS = 0.3
 const SPONSORBLOCK_DEFAULT_CATEGORIES = ["sponsor"]
+const SPONSORBLOCK_DEFAULT_ACTION_TYPES = ["skip"]
+const SPONSORBLOCK_ALL_ACTION_TYPES = ["skip", "mute", "poi", "chapter"]
 const SPONSORBLOCK_ALL_CATEGORIES = [
 	"sponsor",
 	"selfpromo",
@@ -1297,8 +1299,12 @@ const fetchSponsorSegments = async (
 		Array.isArray(categories) && categories.length > 0
 			? categories
 			: SPONSORBLOCK_DEFAULT_CATEGORIES
+	const normalizedActionTypes = isAllSponsorCategoriesSelected(normalizedCategories)
+		? SPONSORBLOCK_ALL_ACTION_TYPES
+		: SPONSORBLOCK_DEFAULT_ACTION_TYPES
 	const categoriesParam = encodeURIComponent(JSON.stringify(normalizedCategories))
-	const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categoriesParam}`
+	const actionTypesParam = encodeURIComponent(JSON.stringify(normalizedActionTypes))
+	const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categoriesParam}&actionTypes=${actionTypesParam}`
 
 	let lastError: unknown
 	for (let attempt = 1; attempt <= SPONSORBLOCK_FETCH_RETRIES; attempt += 1) {
